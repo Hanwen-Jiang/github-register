@@ -1,0 +1,23 @@
+{
+  "name": "github-register",
+  "version": "1.0.0",
+  "description": "GitHub 注册 + cun.ai OAuth 自动化 (Playwright)",
+  "private": true,
+  "type": "commonjs",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "HEADLESS=false node index.js",
+    "headless": "HEADLESS=true node index.js",
+    "test": "node --test",
+    "oauth": "node oauth-only.js",
+    "register:upload": "node register-upload-api-nsnzd.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "playwright": "1.58.2",
+    "socks-proxy-agent": "^10.1.0"
+  }
+}

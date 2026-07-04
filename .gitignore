@@ -1,0 +1,25 @@
+node_modules/
+data/
+.env
+.env.*
+!.env.example
+
+# browser/runtime state
+.browsers/
+.chrome*/
+.claude/
+
+# screenshots and captcha artifacts
+captcha.png
+error.png
+captchas/
+
+# local proxy configs with credentials
+ipproxy.yaml
+sing-box-config.json
+
+# local debug/backups
+debug-signup*.js
+*.bak
+*.bak-*
+index.js.bak*
