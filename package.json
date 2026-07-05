@@ -10,6 +10,8 @@
     "dev": "HEADLESS=false node index.js",
     "headless": "HEADLESS=true node index.js",
     "test": "node --test",
+    "register": "node register-github.js",
+    "oauth:site": "node oauth-site.js",
     "oauth": "node oauth-only.js",
     "register:upload": "node register-upload-api-nsnzd.js",
     "register:batch": "node batch-register-upload.js",

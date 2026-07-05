@@ -8,6 +8,7 @@ data/
 .browsers/
 .chrome*/
 .claude/
+logs/
 
 # screenshots and captcha artifacts
 captcha.png
