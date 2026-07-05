@@ -11,8 +11,10 @@
 //   model whitelist: upstream models ∩ known Claude models, represented as credentials.model_mapping identity map
 
 const path = require('path');
+const { spawn } = require('child_process');
 const {
   buildAnthropicAccountsWithLiveModels,
+  loadLatestResult,
   loadDotEnv,
   normalizeAdminKey,
   resolveDefaultGroupId,
@@ -65,6 +67,40 @@ function readAdminKey() {
   return key;
 }
 
+function resolveResultFile(opts = {}) {
+  const file = opts.resultFile || process.env.RESULT_LOCAL_FILE || path.join(__dirname, 'data', 'results.jsonl');
+  if (String(file).toLowerCase() === 'off') {
+    throw new Error('RESULT_LOCAL_FILE=off cannot be used with register:upload; a local result file is required for the upload handoff');
+  }
+  return file;
+}
+
+async function runRegisterCliAndLoadLatest(opts = {}) {
+  const resultFile = resolveResultFile(opts);
+  const command = opts.command || process.execPath;
+  const args = opts.args || [path.join(__dirname, 'index.js')];
+  const stdio = opts.stdio || 'inherit';
+  const childEnv = {
+    ...process.env,
+    RESULT_LOCAL_FILE: resultFile,
+  };
+
+  await new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd: opts.cwd || __dirname,
+      env: childEnv,
+      stdio,
+    });
+    child.on('error', reject);
+    child.on('exit', (code, signal) => {
+      if (code === 0) return resolve();
+      reject(new Error(`registration command failed: ${signal || `exit ${code}`}`));
+    });
+  });
+
+  return loadLatestResult(resultFile);
+}
+
 async function verifyAdminKey() {
   loadEnv();
   const adminKey = readAdminKey();
@@ -84,7 +120,12 @@ async function runFullRegisterAndUpload(opts = {}) {
 
   const groupId = opts.groupId || await resolveDefaultGroupId({ adminKey });
   const startedAt = new Date();
-  const result = await getRegisterAndRunSites()();
+  const result = opts.registerAndRunSites
+    ? await opts.registerAndRunSites()
+    : (opts.useInProcessRegister || process.env.REGISTER_UPLOAD_IN_PROCESS === 'true')
+      ? await getRegisterAndRunSites()()
+      : await runRegisterCliAndLoadLatest({ resultFile: opts.resultFile });
+  console.log(`[Upload] 读取本次结果: ${result.username || result.email || 'unknown'} / keys=${Array.isArray(result.keys) ? result.keys.length : 0}`);
   const accounts = await buildAnthropicAccountsWithLiveModels(result, {
     adminKey,
     groupIds: [groupId],
@@ -92,8 +133,13 @@ async function runFullRegisterAndUpload(opts = {}) {
     concurrency: 1,
     priority: 1,
     date: startedAt,
+    onRetry: (err, attempt) => {
+      console.log(`[Upload] 模型探测重试 ${attempt}: ${err.message}`);
+    },
   });
+  console.log(`[Upload] 开始导入 api.nsnzd.com: accounts=${accounts.length}`);
   const upload = await uploadAccounts(accounts, { adminKey });
+  console.log(`[Upload] 导入完成: success=${upload?.success ?? 'unknown'} failed=${upload?.failed ?? 'unknown'}`);
 
   return {
     success: true,
@@ -136,6 +182,7 @@ module.exports = {
   DEFAULT_PROXY_LIST,
   ensureProxyConfigured,
   maskProxy,
+  runRegisterCliAndLoadLatest,
   verifyAdminKey,
   runFullRegisterAndUpload,
 };

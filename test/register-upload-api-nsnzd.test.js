@@ -1,8 +1,12 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const {
   ensureProxyConfigured,
   maskProxy,
+  runRegisterCliAndLoadLatest,
 } = require('../register-upload-api-nsnzd');
 
 test('maskProxy hides proxy passwords in logs', () => {
@@ -48,4 +52,28 @@ test('ensureProxyConfigured keeps an explicitly configured proxy', () => {
     if (oldList === undefined) delete process.env.PROXY_LIST; else process.env.PROXY_LIST = oldList;
     if (oldRegisterList === undefined) delete process.env.REGISTER_PROXY_LIST; else process.env.REGISTER_PROXY_LIST = oldRegisterList;
   }
+});
+
+test('runRegisterCliAndLoadLatest runs registration as a child process and loads its JSONL result', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'register-upload-cli-'));
+  const resultFile = path.join(root, 'results.jsonl');
+  const writer = `
+    const fs = require('fs');
+    fs.appendFileSync(process.env.RESULT_LOCAL_FILE, JSON.stringify({
+      success: true,
+      email: 'cli@example.test',
+      username: 'nsnzd-cli-user',
+      keys: [{ site: 'cun.ai', baseUrl: 'https://www.cun.ai', apiKey: 'sk-test' }]
+    }) + '\\n');
+  `;
+
+  const result = await runRegisterCliAndLoadLatest({
+    command: process.execPath,
+    args: ['-e', writer],
+    resultFile,
+    stdio: 'ignore',
+  });
+
+  assert.equal(result.username, 'nsnzd-cli-user');
+  assert.equal(result.keys.length, 1);
 });
