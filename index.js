@@ -94,6 +94,27 @@ const TARGET_SITES = siteFilters.length
     ? SITES.filter(s => siteFilters.some(f => s.name.includes(f) || s.baseUrl.includes(f)))
     : SITES;
 
+// Default routing profiles for a6api/cun.ai multi-key export
+const DEFAULT_ROUTING_PROFILES = [
+    { name: 'dynamic-cheap', routing_enabled: true, routing_preference: 'cheap', pricing_strategy: 'auto', routing_allow_fallback: true },
+    { name: 'dynamic-fast', routing_enabled: true, routing_preference: 'fast', pricing_strategy: 'auto', routing_allow_fallback: true },
+    { name: 'dynamic-stable', routing_enabled: true, routing_preference: 'stable', pricing_strategy: 'auto', routing_allow_fallback: true },
+    { name: 'dynamic-quality', routing_enabled: true, routing_preference: 'quality', pricing_strategy: 'auto', routing_allow_fallback: true },
+];
+
+// Parse ROUTING_PROFILES env (JSON array) or use default
+const routingProfiles = (() => {
+    const raw = (process.env.ROUTING_PROFILES || '').trim();
+    if (!raw) return DEFAULT_ROUTING_PROFILES;
+    try {
+        const parsed = JSON.parse(raw);
+        return Array.isArray(parsed) && parsed.length > 0 ? parsed : DEFAULT_ROUTING_PROFILES;
+    } catch (e) {
+        console.warn(`⚠️  ROUTING_PROFILES parse failed, using default: ${e.message}`);
+        return DEFAULT_ROUTING_PROFILES;
+    }
+})();
+
 // ──────────────────────────────────────────────────────────
 // 2. 姓名生成器（中文姓氏 + 西式名字 → 真人感邮箱）
 // ──────────────────────────────────────────────────────────
@@ -359,7 +380,7 @@ async function pollOTP(email, opts = {}) {
 // ──────────────────────────────────────────────────────────
 // 5. cun.ai API 操作（需要 session cookie）
 // ──────────────────────────────────────────────────────────
-async function siteCreateToken(site, sessionCookie, userId) {
+async function siteCreateToken(site, sessionCookie, userId, profile = null) {
     const base = site.baseUrl;
     console.log(`\n━━━ 📡 ${site.name} — 创建 API Token ━━━`);
 
@@ -373,7 +394,7 @@ async function siteCreateToken(site, sessionCookie, userId) {
     };
 
     const createBody = {
-        name: site.tokenName || 'claude',
+        name: profile ? `${profile.name}-${site.tokenName || 'claude'}` : (site.tokenName || 'claude'),
         remain_quota: site.tokenRemainQuota ?? 0,
         expired_time: site.tokenExpiredTime ?? -1,
         unlimited_quota: site.tokenUnlimitedQuota ?? true,
@@ -382,6 +403,14 @@ async function siteCreateToken(site, sessionCookie, userId) {
         allow_ips: '',
         group: 'default',
         cross_group_retry: false,
+        // Routing fields (only if profile provided)
+        ...(profile ? {
+            routing_enabled: profile.routing_enabled ?? true,
+            routing_preference: profile.routing_preference || 'cheap',
+            pricing_strategy: profile.pricing_strategy || 'auto',
+            pricing_custom_pct: profile.pricing_custom_pct || 50,
+            routing_allow_fallback: profile.routing_allow_fallback ?? true,
+        } : {}),
     };
 
     console.log(`  POST ${base}/api/token/`);
@@ -435,7 +464,7 @@ async function siteCreateToken(site, sessionCookie, userId) {
         throw new Error(`获取 key 失败: ${JSON.stringify(keyJson)}`);
     }
     const fullKey = `sk-${keyJson.data.key}`;
-    return fullKey;
+    return { apiKey: fullKey, profile: profile ? profile.name : null };
 }
 
 
@@ -858,16 +887,33 @@ async function main() {
                 }
                 console.log(`  ✅ ${site.name} user ID: ${siteUserId}`);
 
-                // 8. 创建 API Token
-                const siteKey = await siteCreateToken(site, siteSession, siteUserId);
-                console.log(`  🎉 ${site.name} Key: ${siteKey}`);
+                // 8. 创建 API Token (循环 profiles 建多个)
+                const siteKeys = [];
+                for (const profile of routingProfiles) {
+                    console.log(`  🔧 Creating token with profile: ${profile.name}`);
+                    try {
+                        const keyObj = await siteCreateToken(site, siteSession, siteUserId, profile);
+                        siteKeys.push(keyObj);
+                        console.log(`  ✅ ${profile.name}: ${keyObj.apiKey.substring(0, 12)}...`);
+                    } catch (err) {
+                        console.error(`  ❌ ${profile.name} failed: ${err.message}`);
+                        // Continue with remaining profiles
+                    }
+                }
+                if (siteKeys.length === 0) {
+                    console.log(`  ❌ ${site.name}: 所有 profile 都失败，跳过该站点`);
+                    continue;
+                }
 
-                results.push({
-                    site: site.name,
-                    baseUrl: site.baseUrl,
-                    apiKey: siteKey,
-                    userId: siteUserId,
-                });
+                for (const keyObj of siteKeys) {
+                    results.push({
+                        site: site.name,
+                        baseUrl: site.baseUrl,
+                        apiKey: keyObj.apiKey,
+                        userId: siteUserId,
+                        profile: keyObj.profile,
+                    });
+                }
             }
         }
 
