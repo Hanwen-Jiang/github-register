@@ -2,9 +2,12 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
   buildAnthropicAccountPayload,
+  buildAnthropicAccountsWithLiveModels,
   buildModelMappingFromIntersection,
+  fetchUpstreamModels,
   formatUtcTimestamp,
   normalizeAdminKey,
+  retryAsync,
   siteSlug,
 } = require('../lib/api-nsnzd-uploader');
 
@@ -69,4 +72,61 @@ test('buildAnthropicAccountPayload uses requested name format and Sub2API Anthro
   assert.deepEqual(payload.credentials.model_mapping, {
     'claude-sonnet-4-6': 'claude-sonnet-4-6',
   });
+});
+
+test('retryAsync retries transient failures before returning success', async () => {
+  let attempts = 0;
+
+  const value = await retryAsync(async () => {
+    attempts++;
+    if (attempts < 3) throw new Error(`temporary-${attempts}`);
+    return 'ok';
+  }, {
+    retries: 2,
+    delayMs: 0,
+  });
+
+  assert.equal(value, 'ok');
+  assert.equal(attempts, 3);
+});
+
+test('buildAnthropicAccountsWithLiveModels tries another key from the same site after a model probe failure', async () => {
+  const result = {
+    username: 'nsnzd-probe-user',
+    keys: [
+      { site: 'cun.ai', baseUrl: 'https://www.cun.ai', apiKey: 'sk-first' },
+      { site: 'cun.ai', baseUrl: 'https://www.cun.ai', apiKey: 'sk-second' },
+    ],
+  };
+  const probed = [];
+
+  const accounts = await buildAnthropicAccountsWithLiveModels(result, {
+    groupIds: [1],
+    fetchUpstreamModelsFn: async (key) => {
+      probed.push(key.apiKey);
+      if (key.apiKey === 'sk-first') throw new Error('key not ready');
+      return ['claude-sonnet-4-6', 'gpt-5'];
+    },
+  });
+
+  assert.deepEqual(probed, ['sk-first', 'sk-second']);
+  assert.equal(accounts.length, 2);
+  assert.deepEqual(accounts[0].credentials.model_mapping, {
+    'claude-sonnet-4-6': 'claude-sonnet-4-6',
+  });
+});
+
+test('fetchUpstreamModels uses injected requestImpl (proxy path) and parses ids', async () => {
+  const calls = [];
+  const requestImpl = async (url, opts) => {
+    calls.push({ url, headers: opts.headers });
+    return { ok: true, status: 200, text: async () => JSON.stringify({ data: [{ id: 'claude-opus-4-8' }, { id: 'x' }] }) };
+  };
+  const ids = await fetchUpstreamModels(
+    { apiKey: 'sk-test', baseUrl: 'https://a6api.com', site: 'a6api' },
+    { requestImpl, retries: 0 }
+  );
+  assert.deepEqual(ids, ['claude-opus-4-8', 'x']);
+  assert.match(calls[0].url, /\/v1\/models$/);
+  assert.equal(calls[0].headers.authorization, 'Bearer sk-test');
 });
