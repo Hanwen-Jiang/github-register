@@ -69,7 +69,10 @@ log() {
     echo "$line" >> "$LOG_FILE"
 }
 
-# 投放一个 worker（后台 npm run register），stdout/stderr 分别落到 worker 日志。回显 PID。
+# 投放一个 worker（后台 npm run register），stdout/stderr 分别落到 worker 日志。
+# ⚠️ 必须在主 shell 里直接后台化（不能包在 $(...) 命令替换里，否则 npm 变成子 shell 的
+#    子进程，主 shell 无法用 wait 回收 → wait 返回 127 误判失败）。PID 写入全局 WORKER_PID。
+WORKER_PID=""
 start_worker() {
     local slot="$1" seq="$2"
     local profile_dir="$PROJECT_DIR/.chrome-profile-w$slot"
@@ -84,7 +87,7 @@ start_worker() {
             npm --prefix "$PROJECT_DIR" run register \
             >"$worker_log" 2>"$worker_log.err" &
     fi
-    echo $!
+    WORKER_PID=$!
 }
 
 # ── 单实例锁：同一 project-dir 只允许一个调度器 ──────────────
@@ -197,8 +200,8 @@ while true; do
         LAUNCHED=$((LAUNCHED + 1))
         seq=$LAUNCHED
         log "投放 worker#$seq → slot$slot (profile .chrome-profile-w$slot) | 在跑 $(( ${#RUN_PID[@]} + 1 ))/$CONCURRENCY"
-        pid=$(start_worker "$slot" "$seq")
-        RUN_PID[$slot]=$pid
+        start_worker "$slot" "$seq"
+        RUN_PID[$slot]=$WORKER_PID
         RUN_SEQ[$slot]=$seq
         RUN_START[$slot]=$(date +%s)
 
