@@ -6,6 +6,7 @@ const path = require('path');
 const {
   ensureProxyConfigured,
   maskProxy,
+  pickResidentialProxyIds,
   runRegisterCliAndLoadLatest,
 } = require('../register-upload-api-nsnzd');
 
@@ -54,6 +55,17 @@ test('ensureProxyConfigured keeps an explicitly configured proxy', () => {
   }
 });
 
+test('pickResidentialProxyIds selects active Residential Proxies ids', () => {
+  const ids = pickResidentialProxyIds([
+    { id: 2, name: 'default', status: 'active' },
+    { id: 6, name: 'Residential Proxies', status: 'active' },
+    { id: 7, name: 'Residential Proxies', status: 'inactive' },
+    { id: 8, name: 'Residential Proxies', status: 'active' },
+  ]);
+
+  assert.deepEqual(ids, [6, 8]);
+});
+
 test('runRegisterCliAndLoadLatest runs registration as a child process and loads its JSONL result', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'register-upload-cli-'));
   const resultFile = path.join(root, 'results.jsonl');
@@ -93,6 +105,7 @@ test('runFullRegisterAndUpload marks the ledger after a successful upload', asyn
   await runFullRegisterAndUpload({
     adminKey: 'admin-test',
     groupId: 1,
+    proxyIds: [6],
     registerAndRunSites: async () => result,
     buildAccountsFn: async () => ([{ name: 'n', platform: 'anthropic', type: 'apikey', credentials: { base_url: 'https://a6api.com', api_key: 'sk-x', model_mapping: { 'claude-opus-4-8': 'claude-opus-4-8' } }, concurrency: 1, priority: 1, group_ids: [1] }]),
     uploadFn: async () => ({ success: 1, failed: 0 }),

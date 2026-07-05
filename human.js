@@ -127,7 +127,36 @@ async function humanClick(page, selector) {
  * 逐个输入 OTP 到独立 input（GitHub launch-code 样式）
  */
 async function humanTypeOTP(page, code) {
-    const digits = String(code).split('');
+    const normalized = String(code).replace(/\D/g, '') || String(code);
+    try {
+        await page.waitForSelector('#launch-code-0', { timeout: 10000 });
+        const filled = await page.evaluate((otp) => {
+            const digits = String(otp).split('');
+            const inputs = digits
+                .map((_, i) => document.querySelector(`#launch-code-${i}`))
+                .filter(Boolean);
+            if (inputs.length < digits.length) return false;
+
+            for (let i = 0; i < digits.length; i += 1) {
+                const input = inputs[i];
+                input.focus();
+                const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+                if (setter) setter.call(input, digits[i]);
+                else input.value = digits[i];
+                input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: digits[i] }));
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+                input.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: digits[i] }));
+            }
+
+            inputs[inputs.length - 1]?.blur();
+            return inputs.every((input, i) => input.value === digits[i]);
+        }, normalized);
+        if (filled) return;
+    } catch (_) {
+        // fall back to the slower but robust per-digit path below
+    }
+
+    const digits = normalized.split('');
     for (let i = 0; i < digits.length; i++) {
         const input = page.locator(`#launch-code-${i}`);
         await input.waitFor({ state: 'visible', timeout: 10000 }).catch(() => {});

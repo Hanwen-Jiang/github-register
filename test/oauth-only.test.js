@@ -2,7 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { runQueuedOrFresh } = require('../oauth-only');
 
-test('oauth queue deletes a successful cookie and does not register a fresh account', async () => {
+test('oauth queue keeps a successful cookie by default and does not register a fresh account', async () => {
   const deleted = [];
   let freshCalled = false;
 
@@ -21,11 +21,11 @@ test('oauth queue deletes a successful cookie and does not register a fresh acco
   });
 
   assert.equal(result.cookieFile, '/tmp/github-cookie-a.json');
-  assert.deepEqual(deleted, ['/tmp/github-cookie-a.json']);
+  assert.deepEqual(deleted, []);
   assert.equal(freshCalled, false);
 });
 
-test('oauth queue deletes a failed cookie and tries the next cookie', async () => {
+test('oauth queue keeps a failed cookie by default and tries the next cookie', async () => {
   const deleted = [];
   const attempted = [];
 
@@ -48,7 +48,28 @@ test('oauth queue deletes a failed cookie and tries the next cookie', async () =
 
   assert.equal(result.cookieFile, '/tmp/github-cookie-b.json');
   assert.deepEqual(attempted, ['/tmp/github-cookie-a.json', '/tmp/github-cookie-b.json']);
-  assert.deepEqual(deleted, ['/tmp/github-cookie-a.json', '/tmp/github-cookie-b.json']);
+  assert.deepEqual(deleted, []);
+});
+
+test('oauth queue deletes cookies only when deleteAfterUse is enabled', async () => {
+  const deleted = [];
+
+  const result = await runQueuedOrFresh({
+    log: false,
+    deleteAfterUse: true,
+    cookieFiles: ['/tmp/github-cookie-a.json'],
+    runWithCookieFile: async (file) => ({ success: true, source: 'cookies', cookieFile: file, keys: [] }),
+    runFreshRegistration: async () => {
+      throw new Error('fresh should not run');
+    },
+    deleteCookieFile: (file) => {
+      deleted.push(file);
+      return true;
+    },
+  });
+
+  assert.equal(result.cookieFile, '/tmp/github-cookie-a.json');
+  assert.deepEqual(deleted, ['/tmp/github-cookie-a.json']);
 });
 
 test('oauth queue runs fresh registration when no cookies are available', async () => {

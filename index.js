@@ -20,9 +20,11 @@ const { checkAndSolveCaptcha } = require('./captcha');
 const { startAuthSocksBridge } = require('./auth-socks-bridge');
 const { runSitesOAuthHttp } = require('./lib/hybrid-oauth');
 const { uploadResult } = require('./lib/result-uploader');
+const { saveGithubSession, shouldDeleteGithubCookies } = require('./lib/cookie-store');
 const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
+const crypto = require('crypto');
 
 // ──────────────────────────────────────────────────────────
 // 1. 加载 .env 配置
@@ -159,6 +161,62 @@ function loadQQEmails() {
 
 let _usedEmails = new Set();
 
+function randomEmailSuffix(bytes = 6) {
+    // 6 bytes base36 is compact but gives far more space than the old
+    // given.surname-only fallback.
+    return crypto.randomBytes(bytes).toString('base64url').replace(/[^a-zA-Z0-9]/g, '').toLowerCase().slice(0, 10);
+}
+
+function buildRandomNsnzdEmail(givenName, surname, domain = CONFIG.emailDomain) {
+    const given = String(givenName || randomItem(GIVEN_NAMES)).replace(/[^a-z0-9]/gi, '').toLowerCase() || 'user';
+    const family = String(surname || randomItem(SURNAMES)).replace(/[^a-z0-9]/gi, '').toLowerCase() || 'mail';
+    return `${given}.${family}.${randomEmailSuffix()}@${domain}`;
+}
+
+function reserveEmail(email, opts = {}) {
+    const file = opts.file || process.env.EMAIL_RESERVATION_FILE || path.join(__dirname, 'data', 'used-emails.jsonl');
+    const normalized = String(email || '').trim().toLowerCase();
+    if (!normalized) return false;
+    if (_usedEmails.has(normalized)) return false;
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const lockDir = `${file}.locks`;
+    fs.mkdirSync(lockDir, { recursive: true });
+    const lockName = Buffer.from(normalized).toString('base64url');
+    const lockFile = path.join(lockDir, lockName);
+    let fd = null;
+    let lockFd = null;
+    try {
+        try {
+            lockFd = fs.openSync(lockFile, 'wx');
+        } catch (err) {
+            if (err && err.code === 'EEXIST') {
+                _usedEmails.add(normalized);
+                return false;
+            }
+            throw err;
+        }
+        fd = fs.openSync(file, 'a+');
+        const existing = fs.readFileSync(file, 'utf8')
+            .split(/\r?\n/)
+            .map(s => s.trim().toLowerCase())
+            .filter(Boolean);
+        if (existing.includes(normalized)) {
+            _usedEmails.add(normalized);
+            return false;
+        }
+        fs.appendFileSync(file, `${normalized}\n`);
+        _usedEmails.add(normalized);
+        return true;
+    } finally {
+        if (fd !== null) {
+            try { fs.closeSync(fd); } catch (_) {}
+        }
+        if (lockFd !== null) {
+            try { fs.closeSync(lockFd); } catch (_) {}
+        }
+    }
+}
+
 function randomGithubUsername() {
     const givenName = randomItem(GIVEN_NAMES).replace(/[^a-z0-9]/gi, '').toLowerCase();
     const surname = randomItem(SURNAMES).replace(/[^a-z0-9]/gi, '').toLowerCase();
@@ -203,6 +261,7 @@ async function fillExact(page, selector, value, label) {
 
 async function submitCreateAccountTwiceIfNeeded(page) {
     const submitBtn = page.locator('button[data-disable-invalid="true"]:has-text("Create account")').first();
+    await dismissGitHubCookieBanner(page);
     for (let attempt = 1; attempt <= 2; attempt++) {
         await submitBtn.waitFor({ state: 'visible', timeout: 30000 });
         await page.waitForFunction(() => {
@@ -210,6 +269,9 @@ async function submitCreateAccountTwiceIfNeeded(page) {
                 .find(b => /Create account/i.test(b.textContent || ''));
             return btn && !btn.disabled;
         }, { timeout: 10000 }).catch(() => {});
+        await dismissGitHubCookieBanner(page);
+        await submitBtn.evaluate(el => el.scrollIntoView({ block: 'center', inline: 'center' })).catch(() => {});
+        await humanDelay(150, 400);
         console.log(`  点击 Create account (${attempt}/2)...`);
         await humanClick(page, submitBtn);
         const jumped = await page.waitForFunction(
@@ -221,6 +283,7 @@ async function submitCreateAccountTwiceIfNeeded(page) {
             return true;
         }
         console.log(`  ⚠️ 第 ${attempt} 次点击后仍在: ${page.url()}`);
+        await dismissGitHubCookieBanner(page);
         await humanDelay(900, 2200);
     }
     return false;
@@ -233,14 +296,27 @@ function generateIdentity() {
     if (!email) {
         const qq = loadQQEmails();
         if (qq.length > 0) {
-            const available = qq.filter(e => !_usedEmails.has(e));
-            if (available.length === 0) { _usedEmails.clear(); }
-            email = available.length > 0 ? randomItem(available) : randomItem(qq);
-            _usedEmails.add(email);
+            const shuffled = qq.slice().sort(() => Math.random() - 0.5);
+            for (const candidate of shuffled) {
+                if (reserveEmail(candidate)) {
+                    email = candidate;
+                    break;
+                }
+            }
+            if (!email) throw new Error('QQ_EMAIL_FILE exhausted: no unreserved email available');
         } else {
-            const surname = randomItem(SURNAMES);
-            const givenName = randomItem(GIVEN_NAMES);
-            email = `${givenName}.${surname}@${CONFIG.emailDomain}`;
+            for (let attempt = 0; attempt < 20; attempt++) {
+                const surname = randomItem(SURNAMES);
+                const givenName = randomItem(GIVEN_NAMES);
+                const candidate = buildRandomNsnzdEmail(givenName, surname, CONFIG.emailDomain);
+                if (reserveEmail(candidate)) {
+                    email = candidate;
+                    break;
+                }
+            }
+            if (!email) {
+                throw new Error('unable_to_reserve_unique_email');
+            }
         }
     }
     if (!String(email).endsWith('@nsnzd.com')) {
@@ -277,6 +353,37 @@ function pickProxy() {
 
 function maskProxy(proxyUrl) {
     return String(proxyUrl || '').replace(/:\/\/([^:@/]+):([^@/]+)@/, '://$1:***@');
+}
+
+async function dismissGitHubCookieBanner(page, opts = {}) {
+    const selectors = [
+        'button:has-text("Reject")',
+        'button:has-text("Reject optional cookies")',
+        'button:has-text("Decline")',
+        'button:has-text("Accept")',
+    ];
+    const timeout = opts.timeoutMs ?? 800;
+    const delay = opts.delay || humanDelay;
+
+    for (const selector of selectors) {
+        const button = page.locator(selector).first();
+        const visible = await button.isVisible({ timeout }).catch(() => false);
+        if (!visible) continue;
+        try {
+            await button.click({ force: true });
+        } catch (err) {
+            try {
+                await humanClick(page, button);
+            } catch (_) {
+                throw err;
+            }
+        }
+        if (!opts.quiet) console.log('  ✅ GitHub cookies 横幅已关闭');
+        await delay(150, 450);
+        return true;
+    }
+
+    return false;
 }
 
 function parseProxyForPlaywright(proxyUrl) {
@@ -501,7 +608,7 @@ async function ensureGithubLoggedIn(page, identity) {
 async function main() {
     const startedAt = Date.now();
     let identity = generateIdentity();
-    let savedGithubCookiePath = null;
+    let savedGithubCookiePaths = [];
 
     console.log('═══════════════════════════════════════════');
     console.log('  GitHub 注册 + cun.ai OAuth 自动化');
@@ -531,7 +638,7 @@ async function main() {
     ];
     const viewport = randomItem(viewports);
 
-    const userDataDir = path.join(__dirname, '.chrome-profile');
+    const userDataDir = process.env.CHROME_PROFILE_DIR || path.join(__dirname, '.chrome-profile');
 
     const launchOpts = {
         headless: CONFIG.headless,
@@ -597,6 +704,7 @@ async function main() {
             timeout: 60000,
         });
         await humanDelay(1500, 4500);
+        await dismissGitHubCookieBanner(page);
 
         // ⚠️  GitHub 注册页面上方有 "Continue with Google/GitHub" 等社交登录按钮，
         //    它们也是 button[type="submit"]。必须精确定位邮箱注册表单的按钮，
@@ -648,7 +756,10 @@ async function main() {
             const errors = await page.locator('[role="alert"], .error, .flash-error, #signup-form-error').allTextContents().catch(() => []);
             if (errors.length > 0) console.log(`  GitHub 错误: ${errors.join('; ')}`);
             console.log(`  ❌ Create account 未成功，保存截图；不会点击 Google/Apple 登录按钮`);
-            await page.screenshot({ path: path.join(__dirname, 'captchas', 'signup-failed.png'), fullPage: true }).catch(() => {});
+            await page.screenshot({
+                path: process.env.SIGNUP_FAILED_SCREENSHOT_FILE || path.join(__dirname, 'captchas', 'signup-failed.png'),
+                fullPage: true,
+            }).catch(() => {});
             throw new Error('github_create_account_not_submitted');
         }
 
@@ -711,6 +822,7 @@ async function main() {
                 // 重新走一遍注册流程
                 await page.goto('https://github.com/signup', { waitUntil: 'domcontentloaded', timeout: 30000 });
                 await humanDelay(1200, 3000);
+                await dismissGitHubCookieBanner(page);
                 await fillExact(page, 'input#email, input[name="user[email]"]', identity.email, 'email');
                 console.log('  等待邮箱验证...');
                 try { await page.waitForSelector('button[data-continue-to="password-container"]', { timeout: 30000 }); } catch (_) {}
@@ -759,13 +871,18 @@ async function main() {
 
         await ensureGithubLoggedIn(page, identity);
 
-        // 保存 GitHub 登录 cookies，后续可用 oauth-only.js 只调试 Phase 5，避免重复注册账号。
+        // 持久化保存 GitHub 登录 cookies，后续可用 oauth-only.js 只调试 Phase 5，避免重复注册账号。
         try {
-            const cookiePath = process.env.GITHUB_COOKIES_FILE || path.join(__dirname, 'data', 'github-cookies.json');
-            fs.mkdirSync(path.dirname(cookiePath), { recursive: true });
-            fs.writeFileSync(cookiePath, JSON.stringify(await context.cookies('https://github.com'), null, 2));
-            savedGithubCookiePath = cookiePath;
-            console.log(`  ✅ GitHub cookies 已保存: ${cookiePath}`);
+            const saved = saveGithubSession({
+                cookies: await context.cookies('https://github.com'),
+                rootDir: __dirname,
+                file: process.env.GITHUB_COOKIES_FILE || path.join(__dirname, 'data', 'github-cookies.json'),
+                username: identity.username,
+                email: identity.email,
+            });
+            savedGithubCookiePaths = [...new Set([saved.primary, saved.archive].filter(Boolean))];
+            console.log(`  ✅ GitHub cookies 已保存: ${saved.primary}`);
+            console.log(`  ✅ GitHub session 已归档: ${saved.archive}`);
         } catch (e) {
             console.log(`  ⚠️ GitHub cookies 保存失败: ${e.message}`);
         }
@@ -940,9 +1057,11 @@ async function main() {
             durationSeconds: parseFloat(duration),
         };
         await uploadResult({ ...result, source: 'fresh-registration' }, { meta: { source: 'index' } });
-        if (savedGithubCookiePath && process.env.KEEP_GITHUB_COOKIES !== 'true') {
-            fs.rmSync(savedGithubCookiePath, { force: true });
-            console.log(`  ✅ GitHub cookies 已消费并删除: ${savedGithubCookiePath}`);
+        if (savedGithubCookiePaths.length > 0 && shouldDeleteGithubCookies()) {
+            for (const cookiePath of savedGithubCookiePaths) {
+                fs.rmSync(cookiePath, { force: true });
+            }
+            console.log(`  ✅ GitHub cookies 已按配置删除: ${savedGithubCookiePaths.join(', ')}`);
         }
         console.log(JSON.stringify(result, null, 2));
         return result;
@@ -950,13 +1069,17 @@ async function main() {
     } catch (err) {
         console.error(`\n❌ 流程失败: ${err.message}`);
         console.error(err.stack);
-        if (savedGithubCookiePath && process.env.KEEP_GITHUB_COOKIES !== 'true') {
-            fs.rmSync(savedGithubCookiePath, { force: true });
-            console.log(`已删除失败流程 cookies: ${savedGithubCookiePath}`);
+        if (savedGithubCookiePaths.length > 0 && shouldDeleteGithubCookies()) {
+            for (const cookiePath of savedGithubCookiePaths) {
+                fs.rmSync(cookiePath, { force: true });
+            }
+            console.log(`已按配置删除失败流程 cookies: ${savedGithubCookiePaths.join(', ')}`);
         }
         // 截图保存现场
-        await page.screenshot({ path: path.join(__dirname, 'error.png') }).catch(() => {});
-        console.log('已保存错误截图: error.png');
+        const errorScreenshot = process.env.ERROR_SCREENSHOT_FILE || path.join(__dirname, 'error.png');
+        fs.mkdirSync(path.dirname(errorScreenshot), { recursive: true });
+        await page.screenshot({ path: errorScreenshot }).catch(() => {});
+        console.log(`已保存错误截图: ${errorScreenshot}`);
         throw err;
     } finally {
         await context.close().catch(() => {});
@@ -979,4 +1102,4 @@ if (require.main === module) {
         });
 }
 
-module.exports = { main, generateIdentity, pollOTP, siteCreateToken, SITES, TARGET_SITES, randomGithubUsername, assertSafeGithubUsername, isGithubLoggedInUrl, ensureGithubLoggedIn };
+module.exports = { main, generateIdentity, reserveEmail, buildRandomNsnzdEmail, pollOTP, siteCreateToken, SITES, TARGET_SITES, randomGithubUsername, assertSafeGithubUsername, isGithubLoggedInUrl, ensureGithubLoggedIn, dismissGitHubCookieBanner };

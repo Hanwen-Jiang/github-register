@@ -3,10 +3,13 @@ const assert = require('node:assert/strict');
 const {
   buildAnthropicAccountPayload,
   buildAnthropicAccountsWithLiveModels,
+  buildAnthropicAccountsFromResult,
   buildModelMappingFromIntersection,
   fetchUpstreamModels,
   formatUtcTimestamp,
   normalizeAdminKey,
+  normalizeResultKeys,
+  resolveModelProxy,
   retryAsync,
   siteSlug,
 } = require('../lib/api-nsnzd-uploader');
@@ -116,6 +119,49 @@ test('buildAnthropicAccountsWithLiveModels tries another key from the same site 
   });
 });
 
+test('buildAnthropicAccountsFromResult assigns proxy ids round-robin when provided', () => {
+  const result = {
+    username: 'nsnzd-proxy-user',
+    keys: [
+      { site: 'cun.ai', baseUrl: 'https://www.cun.ai', apiKey: 'sk-1' },
+      { site: 'cun.ai', baseUrl: 'https://www.cun.ai', apiKey: 'sk-2' },
+      { site: 'a6api', baseUrl: 'https://a6api.com', apiKey: 'sk-3' },
+      { site: 'a6api', baseUrl: 'https://a6api.com', apiKey: 'sk-4' },
+    ],
+  };
+
+  const accounts = buildAnthropicAccountsFromResult(result, {
+    upstreamModels: ['claude-sonnet-4-6'],
+    proxyIds: [6, 7, 8],
+  });
+
+  assert.deepEqual(accounts.map(a => a.proxy_id), [6, 7, 8, 6]);
+});
+
+test('normalizeResultKeys flattens legacy per-site nested keys', () => {
+  const keys = normalizeResultKeys({
+    keys: [
+      {
+        site: 'cun.ai',
+        baseUrl: 'https://www.cun.ai',
+        userId: '9553',
+        keys: [{ apiKey: 'sk-cun', profile: 'dynamic-cheap' }],
+      },
+      {
+        site: 'a6api',
+        baseUrl: 'https://a6api.com',
+        userId: '3114',
+        keys: [{ apiKey: 'sk-a6', profile: 'dynamic-fast' }],
+      },
+    ],
+  });
+
+  assert.deepEqual(keys, [
+    { site: 'cun.ai', baseUrl: 'https://www.cun.ai', userId: '9553', apiKey: 'sk-cun', profile: 'dynamic-cheap' },
+    { site: 'a6api', baseUrl: 'https://a6api.com', userId: '3114', apiKey: 'sk-a6', profile: 'dynamic-fast' },
+  ]);
+});
+
 test('fetchUpstreamModels uses injected requestImpl (proxy path) and parses ids', async () => {
   const calls = [];
   const requestImpl = async (url, opts) => {
@@ -129,4 +175,33 @@ test('fetchUpstreamModels uses injected requestImpl (proxy path) and parses ids'
   assert.deepEqual(ids, ['claude-opus-4-8', 'x']);
   assert.match(calls[0].url, /\/v1\/models$/);
   assert.equal(calls[0].headers.authorization, 'Bearer sk-test');
+});
+
+test('resolveModelProxy ignores registration PROXY by default for upload model probing', () => {
+  assert.equal(
+    resolveModelProxy({}, { PROXY: 'socks5://registration-proxy:10000' }),
+    ''
+  );
+});
+
+test('resolveModelProxy only uses explicit upload/model proxy settings', () => {
+  assert.equal(
+    resolveModelProxy({}, {
+      PROXY: 'socks5://registration-proxy:10000',
+      UPLOAD_MODEL_PROXY: 'socks5://upload-model-proxy:10000',
+    }),
+    'socks5://upload-model-proxy:10000'
+  );
+  assert.equal(
+    resolveModelProxy({ modelProxy: 'socks5://explicit-model-proxy:10000' }, {
+      UPLOAD_MODEL_PROXY: 'socks5://upload-model-proxy:10000',
+    }),
+    'socks5://explicit-model-proxy:10000'
+  );
+  assert.equal(
+    resolveModelProxy({ proxy: 'socks5://explicit-legacy-proxy:10000' }, {
+      UPLOAD_MODEL_PROXY: 'socks5://upload-model-proxy:10000',
+    }),
+    'socks5://explicit-legacy-proxy:10000'
+  );
 });

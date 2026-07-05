@@ -1,15 +1,15 @@
-// oauth-only.js — consume queued GitHub cookie files to run Phase 5.
+// oauth-only.js — reuse queued GitHub cookie files to run Phase 5.
 //
 // Behavior:
 //   1. If cookie files exist, use the first one to register site keys.
-//   2. On success, upload/archive result and delete that cookie file.
-//   3. On failure, delete that cookie file and try the next.
+//   2. On success, upload/archive result and keep that cookie file by default.
+//   3. On failure, keep that cookie file by default and try the next.
 //   4. If no cookies remain, automatically run full GitHub registration via index.js.
 const fs = require('fs');
 const path = require('path');
 const { main: registerAndRunSites, TARGET_SITES } = require('./index');
 const { runSitesOAuthHttp } = require('./lib/hybrid-oauth');
-const { listCookieFiles, loadCookies, deleteCookieFile, defaultCookieFile } = require('./lib/cookie-store');
+const { listCookieFiles, loadCookies, deleteCookieFile, defaultCookieFile, shouldDeleteGithubCookies } = require('./lib/cookie-store');
 const { uploadResult } = require('./lib/result-uploader');
 
 function loadEnv() {
@@ -43,7 +43,7 @@ async function runFreshRegistration() {
   } catch (err) {
     throw err;
   } finally {
-    deleteCookieFile(cookieFile);
+    if (shouldDeleteGithubCookies()) deleteCookieFile(cookieFile);
   }
 }
 
@@ -55,18 +55,23 @@ async function runQueuedOrFresh(opts = {}) {
   const runCookie = opts.runWithCookieFile || runWithCookieFile;
   const runFresh = opts.runFreshRegistration || runFreshRegistration;
   const removeCookie = opts.deleteCookieFile || deleteCookieFile;
+  const deleteAfterUse = opts.deleteAfterUse ?? shouldDeleteGithubCookies();
 
   for (const cookieFile of cookieFiles) {
     try {
       log(`使用 GitHub cookies: ${cookieFile}`);
       const result = await runCookie(cookieFile);
-      removeCookie(cookieFile);
-      log(`✅ cookie 已消费并删除: ${cookieFile}`);
+      if (deleteAfterUse) {
+        removeCookie(cookieFile);
+        log(`✅ cookie 已消费并删除: ${cookieFile}`);
+      } else {
+        log(`✅ cookie 已复用并保留: ${cookieFile}`);
+      }
       return result;
     } catch (err) {
-      error(`❌ cookie 注册站点失败，删除并尝试下一个: ${cookieFile}`);
+      error(`❌ cookie 注册站点失败，尝试下一个: ${cookieFile}`);
       error(err.message);
-      removeCookie(cookieFile);
+      if (deleteAfterUse) removeCookie(cookieFile);
     }
   }
 

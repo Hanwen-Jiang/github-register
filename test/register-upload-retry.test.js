@@ -17,14 +17,19 @@ test('reuploadUnuploaded uploads only results missing from the ledger and marks 
   markUploaded(r1, { ledgerFile }); // r1 already uploaded
 
   const uploaded = [];
+  let seenProxyIds = null;
   const res = await reuploadUnuploaded({
-    resultsFile, ledgerFile, adminKey: 'admin-test', groupId: 1,
-    buildAccountsFn: async (r) => ([{ name: 'n-' + r.source, platform: 'anthropic', type: 'apikey', credentials: { base_url: 'https://a6api.com', api_key: r.keys[0].apiKey, model_mapping: { x: 'x' } }, group_ids: [1] }]),
+    resultsFile, ledgerFile, adminKey: 'admin-test', groupId: 1, proxyIds: [6, 7, 8],
+    buildAccountsFn: async (r, opts) => {
+      seenProxyIds = opts.proxyIds;
+      return [{ name: 'n-' + r.source, platform: 'anthropic', type: 'apikey', credentials: { base_url: 'https://a6api.com', api_key: r.keys[0].apiKey, model_mapping: { x: 'x' } }, group_ids: [1], proxy_id: opts.proxyIds[0] }];
+    },
     uploadFn: async (accts) => { uploaded.push(accts[0].name); return { success: 1, failed: 0 }; },
   });
 
   assert.equal(res.attempted, 1);
   assert.equal(res.succeeded, 1);
   assert.deepEqual(uploaded, ['n-r2']);       // only r2 re-uploaded
+  assert.deepEqual(seenProxyIds, [6, 7, 8]);
   assert.ok(loadUploadedIds(ledgerFile).has('r2'));
 });

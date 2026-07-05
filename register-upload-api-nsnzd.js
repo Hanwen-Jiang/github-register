@@ -17,6 +17,7 @@ const {
   loadLatestResult,
   loadDotEnv,
   normalizeAdminKey,
+  apiNsnzdGet,
   resolveDefaultGroupId,
   retryAsync,
   summarizeSecret,
@@ -67,6 +68,33 @@ function readAdminKey() {
   const key = normalizeAdminKey(process.env.API_NSNZD_COM_ADMIN_KEY || '');
   if (!key) throw new Error('API_NSNZD_COM_ADMIN_KEY is required');
   return key;
+}
+
+function pickResidentialProxyIds(proxies) {
+  return (Array.isArray(proxies) ? proxies : [])
+    .filter(p => String(p.name || '').toLowerCase() === 'residential proxies')
+    .filter(p => !p.status || String(p.status).toLowerCase() === 'active')
+    .map(p => p.id)
+    .filter(id => id !== null && id !== undefined);
+}
+
+async function resolveResidentialProxyIds(opts = {}) {
+  if (Array.isArray(opts.proxyIds)) return opts.proxyIds;
+  const envIds = String(process.env.UPLOAD_PROXY_IDS || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean)
+    .map(Number)
+    .filter(Number.isFinite);
+  if (envIds.length > 0) return envIds;
+  if (process.env.UPLOAD_PROXY_MODE === 'none') return [];
+
+  const proxies = await apiNsnzdGet('/api/v1/admin/proxies/all?include_inactive=true', opts);
+  const ids = pickResidentialProxyIds(proxies);
+  if (ids.length === 0) {
+    throw new Error('no active Residential Proxies found; set UPLOAD_PROXY_MODE=none to import without proxy');
+  }
+  return ids;
 }
 
 function resolveResultFile(opts = {}) {
@@ -121,6 +149,7 @@ async function runFullRegisterAndUpload(opts = {}) {
   const adminKey = opts.adminKey || readAdminKey();
 
   const groupId = opts.groupId || await resolveDefaultGroupId({ adminKey });
+  const proxyIds = await resolveResidentialProxyIds({ adminKey, proxyIds: opts.proxyIds });
   const startedAt = new Date();
   const ledgerFile = opts.ledgerFile || process.env.UPLOAD_LEDGER_FILE || path.join(__dirname, 'data', 'uploaded.jsonl');
   const uploadRetries = opts.uploadRetries ?? parseInt(process.env.UPLOAD_RETRIES || '2', 10);
@@ -132,6 +161,7 @@ async function runFullRegisterAndUpload(opts = {}) {
       ? await getRegisterAndRunSites()()
       : await runRegisterCliAndLoadLatest({ resultFile: opts.resultFile });
   console.log(`[Upload] 读取本次结果: ${result.username || result.email || 'unknown'} / keys=${Array.isArray(result.keys) ? result.keys.length : 0}`);
+  console.log(`[Upload] 账号代理池 Residential Proxies: ${proxyIds.length > 0 ? proxyIds.join(',') : 'disabled'}`);
 
   const buildAccounts = opts.buildAccountsFn || ((r, o) => buildAnthropicAccountsWithLiveModels(r, o));
   const doUpload = opts.uploadFn || ((accts, o) => uploadAccounts(accts, o));
@@ -144,6 +174,7 @@ async function runFullRegisterAndUpload(opts = {}) {
       concurrency: 1,
       priority: 1,
       date: startedAt,
+      proxyIds,
       onRetry: (err, attempt) => {
         console.log(`[Upload] 模型探测重试 ${attempt}: ${err.message}`);
       },
@@ -203,6 +234,8 @@ module.exports = {
   DEFAULT_PROXY_LIST,
   ensureProxyConfigured,
   maskProxy,
+  pickResidentialProxyIds,
+  resolveResidentialProxyIds,
   runRegisterCliAndLoadLatest,
   verifyAdminKey,
   runFullRegisterAndUpload,

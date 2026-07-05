@@ -8,6 +8,7 @@ const {
   normalizeAdminKey,
   loadDotEnv,
 } = require('./lib/api-nsnzd-uploader');
+const { resolveResidentialProxyIds } = require('./register-upload-api-nsnzd');
 
 function applyDotEnv() {
   const env = loadDotEnv(path.join(__dirname, '.env'));
@@ -20,6 +21,7 @@ async function reuploadUnuploaded(opts = {}) {
   const adminKey = opts.adminKey || normalizeAdminKey(process.env.API_NSNZD_COM_ADMIN_KEY || '');
   if (!adminKey) throw new Error('API_NSNZD_COM_ADMIN_KEY is required');
   const groupId = opts.groupId || await resolveDefaultGroupId({ adminKey });
+  const proxyIds = await resolveResidentialProxyIds({ adminKey, proxyIds: opts.proxyIds });
   const buildAccounts = opts.buildAccountsFn || ((r, o) => buildAnthropicAccountsWithLiveModels(r, o));
   const doUpload = opts.uploadFn || ((a, o) => uploadAccounts(a, o));
 
@@ -35,6 +37,7 @@ async function reuploadUnuploaded(opts = {}) {
         groupName: 'default',
         concurrency: 1,
         priority: 1,
+        proxyIds,
       });
       await doUpload(accounts, { adminKey });
       markUploaded(result, { ledgerFile });

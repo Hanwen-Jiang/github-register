@@ -5,9 +5,12 @@ const os = require('os');
 const path = require('path');
 const {
   defaultCookieFile,
+  defaultCookieDir,
+  shouldDeleteGithubCookies,
   listCookieFiles,
   loadCookies,
   deleteCookieFile,
+  saveGithubSession,
   saveCookies,
 } = require('../lib/cookie-store');
 
@@ -40,4 +43,27 @@ test('cookie store loads and deletes a cookie file', () => {
   assert.equal(loadCookies(file)[0].name, 'user_session');
   assert.equal(deleteCookieFile(file), true);
   assert.equal(fs.existsSync(file), false);
+});
+
+test('shouldDeleteGithubCookies keeps sessions by default', () => {
+  assert.equal(shouldDeleteGithubCookies({}), false);
+  assert.equal(shouldDeleteGithubCookies({ DELETE_GITHUB_COOKIES_AFTER_USE: 'true' }), true);
+  assert.equal(shouldDeleteGithubCookies({ KEEP_GITHUB_COOKIES: 'false' }), true);
+});
+
+test('saveGithubSession writes explicit file and persistent session archive', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cookie-store-'));
+  const explicit = path.join(root, 'one-shot.json');
+  const saved = saveGithubSession({
+    cookies: [{ name: 'user_session', value: 'abc', domain: '.github.com', path: '/' }],
+    rootDir: root,
+    file: explicit,
+    username: 'nsnzd-user',
+    now: new Date('2026-07-06T12:34:56Z'),
+  });
+
+  assert.equal(saved.primary, explicit);
+  assert.equal(fs.existsSync(explicit), true);
+  assert.equal(saved.archive, path.join(defaultCookieDir(root), '20260706123456-nsnzd-user.json'));
+  assert.equal(loadCookies(saved.archive)[0].name, 'user_session');
 });
