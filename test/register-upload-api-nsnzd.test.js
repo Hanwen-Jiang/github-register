@@ -77,3 +77,28 @@ test('runRegisterCliAndLoadLatest runs registration as a child process and loads
   assert.equal(result.username, 'nsnzd-cli-user');
   assert.equal(result.keys.length, 1);
 });
+
+test('runFullRegisterAndUpload marks the ledger after a successful upload', async () => {
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+  const { runFullRegisterAndUpload } = require('../register-upload-api-nsnzd');
+  const { loadUploadedIds } = require('../lib/upload-ledger');
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'reg-ledger-'));
+  const ledgerFile = path.join(dir, 'uploaded.jsonl');
+
+  const result = { username: 'u-led', uploaded_at: 't-led', source: 'run-led', keys: [{ site: 'a6api', baseUrl: 'https://a6api.com', apiKey: 'sk-x' }] };
+
+  await runFullRegisterAndUpload({
+    adminKey: 'admin-test',
+    groupId: 1,
+    registerAndRunSites: async () => result,
+    buildAccountsFn: async () => ([{ name: 'n', platform: 'anthropic', type: 'apikey', credentials: { base_url: 'https://a6api.com', api_key: 'sk-x', model_mapping: { 'claude-opus-4-8': 'claude-opus-4-8' } }, concurrency: 1, priority: 1, group_ids: [1] }]),
+    uploadFn: async () => ({ success: 1, failed: 0 }),
+    ledgerFile,
+  });
+
+  const ids = loadUploadedIds(ledgerFile);
+  assert.ok(ids.has('run-led'));
+});

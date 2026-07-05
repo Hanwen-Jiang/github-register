@@ -12,6 +12,7 @@
     "test": "node --test",
     "oauth": "node oauth-only.js",
     "register:upload": "node register-upload-api-nsnzd.js",
+    "register:upload-retry": "node register-upload-retry.js",
     "watch:pool": "node pool-watcher.js"
   },
   "engines": {

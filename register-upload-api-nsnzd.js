@@ -18,9 +18,11 @@ const {
   loadDotEnv,
   normalizeAdminKey,
   resolveDefaultGroupId,
+  retryAsync,
   summarizeSecret,
   uploadAccounts,
 } = require('./lib/api-nsnzd-uploader');
+const { markUploaded } = require('./lib/upload-ledger');
 
 const DEFAULT_PROXY_LIST = [];
 
@@ -120,26 +122,45 @@ async function runFullRegisterAndUpload(opts = {}) {
 
   const groupId = opts.groupId || await resolveDefaultGroupId({ adminKey });
   const startedAt = new Date();
+  const ledgerFile = opts.ledgerFile || process.env.UPLOAD_LEDGER_FILE || path.join(__dirname, 'data', 'uploaded.jsonl');
+  const uploadRetries = opts.uploadRetries ?? parseInt(process.env.UPLOAD_RETRIES || '2', 10);
+  const uploadRetryDelayMs = opts.uploadRetryDelayMs ?? parseInt(process.env.UPLOAD_RETRY_DELAY_MS || '2000', 10);
+
   const result = opts.registerAndRunSites
     ? await opts.registerAndRunSites()
     : (opts.useInProcessRegister || process.env.REGISTER_UPLOAD_IN_PROCESS === 'true')
       ? await getRegisterAndRunSites()()
       : await runRegisterCliAndLoadLatest({ resultFile: opts.resultFile });
   console.log(`[Upload] 读取本次结果: ${result.username || result.email || 'unknown'} / keys=${Array.isArray(result.keys) ? result.keys.length : 0}`);
-  const accounts = await buildAnthropicAccountsWithLiveModels(result, {
-    adminKey,
-    groupIds: [groupId],
-    groupName: 'default',
-    concurrency: 1,
-    priority: 1,
-    date: startedAt,
+
+  const buildAccounts = opts.buildAccountsFn || ((r, o) => buildAnthropicAccountsWithLiveModels(r, o));
+  const doUpload = opts.uploadFn || ((accts, o) => uploadAccounts(accts, o));
+
+  const { accounts, upload } = await retryAsync(async () => {
+    const accounts = await buildAccounts(result, {
+      adminKey,
+      groupIds: [groupId],
+      groupName: 'default',
+      concurrency: 1,
+      priority: 1,
+      date: startedAt,
+      onRetry: (err, attempt) => {
+        console.log(`[Upload] 模型探测重试 ${attempt}: ${err.message}`);
+      },
+    });
+    console.log(`[Upload] 开始导入 api.nsnzd.com: accounts=${accounts.length}`);
+    const upload = await doUpload(accounts, { adminKey });
+    return { accounts, upload };
+  }, {
+    retries: uploadRetries,
+    delayMs: uploadRetryDelayMs,
     onRetry: (err, attempt) => {
-      console.log(`[Upload] 模型探测重试 ${attempt}: ${err.message}`);
+      console.log(`[Upload] 导入重试 ${attempt}: ${err.message}`);
     },
   });
-  console.log(`[Upload] 开始导入 api.nsnzd.com: accounts=${accounts.length}`);
-  const upload = await uploadAccounts(accounts, { adminKey });
-  console.log(`[Upload] 导入完成: success=${upload?.success ?? 'unknown'} failed=${upload?.failed ?? 'unknown'}`);
+
+  markUploaded(result, { ledgerFile });
+  console.log(`[Upload] 导入完成并记账: success=${upload?.success ?? 'unknown'} failed=${upload?.failed ?? 'unknown'}`);
 
   return {
     success: true,
