@@ -782,9 +782,9 @@ async function main() {
         if (CONFIG.hybridHttpOAuth) {
             console.log('  模式: Hybrid HTTP OAuth（GitHub 注册保留浏览器，OAuth/Token 使用 HTTP）');
             const githubCookies = await context.cookies();
-            results = await runSitesOAuthHttp(TARGET_SITES, githubCookies, { proxyUrl: browserProxyUrl || proxyUrl || '' });
+            results = await runSitesOAuthHttp(TARGET_SITES, githubCookies, { proxyUrl: browserProxyUrl || proxyUrl || '', routingProfiles });
             for (const r of results) {
-                console.log(`  🎉 ${r.site} Key: ${r.apiKey}`);
+                console.log(`  🎉 ${r.site} [${r.profile || 'default'}] Key: ${r.apiKey.substring(0, 12)}...`);
             }
         } else {
             console.log('  模式: Browser OAuth fallback（HYBRID_HTTP_OAUTH=false）');

@@ -60,7 +60,7 @@ test('runSiteOAuthHttp completes GitHub OAuth callback and creates target token 
     { transport }
   );
 
-  assert.deepEqual(result, { site: 'cun.ai', baseUrl: 'https://www.cun.ai', apiKey: 'sk-abc', userId: '42' });
+  assert.deepEqual(result, { site: 'cun.ai', baseUrl: 'https://www.cun.ai', userId: '42', keys: [{ apiKey: 'sk-abc', profile: null }] });
   assert.deepEqual(calls.map(c => c.url), [
     'https://www.cun.ai/sign-in',
     'https://www.cun.ai/api/oauth/state?aff=',
@@ -190,7 +190,7 @@ test('runSiteOAuthHttp follows callback link from GitHub OAuth authorized HTML p
     throw new Error(`unexpected ${url}`);
   };
   const result = await runSiteOAuthHttp({ name: 'cun.ai', baseUrl: 'https://www.cun.ai', clientId: 'CLIENT' }, [], { transport });
-  assert.equal(result.apiKey, 'sk-abc');
+  assert.equal(result.keys[0].apiKey, 'sk-abc');
   assert.ok(calls.includes('https://www.cun.ai/api/oauth/github?code=SECRET_CODE&state=STATE123'));
 });
 
@@ -225,7 +225,7 @@ test('runSiteOAuthHttp calls target OAuth API after extracting SPA callback URL'
     throw new Error(`unexpected ${url}`);
   };
   const result = await runSiteOAuthHttp({ name: 'cun.ai', baseUrl: 'https://www.cun.ai', clientId: 'CLIENT' }, [], { transport });
-  assert.equal(result.apiKey, 'sk-abc');
+  assert.equal(result.keys[0].apiKey, 'sk-abc');
   assert.ok(calls.includes('https://www.cun.ai/api/oauth/github?code=SECRET_CODE&state=STATE123'));
 });
 
@@ -254,7 +254,7 @@ test('runSiteOAuthHttp reuses user id returned by target OAuth API callback', as
   };
   const result = await runSiteOAuthHttp({ name: 'cun.ai', baseUrl: 'https://www.cun.ai', clientId: 'CLIENT' }, [], { transport });
   assert.equal(result.userId, '9202');
-  assert.equal(result.apiKey, 'sk-abc');
+  assert.equal(result.keys[0].apiKey, 'sk-abc');
 });
 
 test('runSiteOAuthHttp includes token key response diagnostics when key fetch fails', async () => {
