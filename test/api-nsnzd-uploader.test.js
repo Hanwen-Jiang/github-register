@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const {
   buildAnthropicAccountPayload,
   buildAnthropicAccountsWithLiveModels,
+  buildAnthropicAccountsFromResult,
   buildModelMappingFromIntersection,
   fetchUpstreamModels,
   formatUtcTimestamp,
@@ -114,6 +115,25 @@ test('buildAnthropicAccountsWithLiveModels tries another key from the same site 
   assert.deepEqual(accounts[0].credentials.model_mapping, {
     'claude-sonnet-4-6': 'claude-sonnet-4-6',
   });
+});
+
+test('buildAnthropicAccountsFromResult assigns proxy ids round-robin when provided', () => {
+  const result = {
+    username: 'nsnzd-proxy-user',
+    keys: [
+      { site: 'cun.ai', baseUrl: 'https://www.cun.ai', apiKey: 'sk-1' },
+      { site: 'cun.ai', baseUrl: 'https://www.cun.ai', apiKey: 'sk-2' },
+      { site: 'a6api', baseUrl: 'https://a6api.com', apiKey: 'sk-3' },
+      { site: 'a6api', baseUrl: 'https://a6api.com', apiKey: 'sk-4' },
+    ],
+  };
+
+  const accounts = buildAnthropicAccountsFromResult(result, {
+    upstreamModels: ['claude-sonnet-4-6'],
+    proxyIds: [6, 7, 8],
+  });
+
+  assert.deepEqual(accounts.map(a => a.proxy_id), [6, 7, 8, 6]);
 });
 
 test('fetchUpstreamModels uses injected requestImpl (proxy path) and parses ids', async () => {

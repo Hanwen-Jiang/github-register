@@ -14,12 +14,15 @@
 //   PROXY=http://127.0.0.1:7890 node index.js  # 指定代理
 //   HEADLESS=true node index.js            # 无头模式（调试用）
 
-const { chromium } = require('playwright');
+// playwright is required lazily inside registerGithubAccount so that index.js can be
+// imported for its pure functions (siteCreateToken, generateIdentity, ...) in
+// environments without playwright installed (e.g. local unit tests).
 const { humanDelay, humanType, humanClick, humanTypeOTP, humanScroll } = require('./human');
 const { checkAndSolveCaptcha } = require('./captcha');
 const { startAuthSocksBridge } = require('./auth-socks-bridge');
 const { runSitesOAuthHttp } = require('./lib/hybrid-oauth');
 const { uploadResult } = require('./lib/result-uploader');
+const identityGen = require('./lib/identity');
 const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
@@ -49,7 +52,7 @@ loadEnv();
 const CONFIG = {
     mailopsBaseUrl: (process.env.MAILOPS_BASE_URL || 'https://admin.mailops.nsnzd.com').replace(/\/+$/, ''),
     mailopsApiToken: process.env.MAILOPS_API_TOKEN || '',
-    emailDomain: process.env.EMAIL_DOMAIN || 'nsnzd.com',
+    emailDomains: (process.env.EMAIL_DOMAINS || process.env.EMAIL_DOMAIN || 'nsnzd.com').split(',').map(s => s.trim()).filter(Boolean),
     defaultPassword: process.env.DEFAULT_PASSWORD || '',
     cunaiBaseUrl: (process.env.CUNAI_BASE_URL || 'https://www.cun.ai').replace(/\/+$/, ''),
     headless: process.env.HEADLESS === 'true',
@@ -63,57 +66,10 @@ const CONFIG = {
 };
 
 // ──────────────────────────────────────────────────────────
-// 目标站点（new-api 系，同一 GitHub OAuth App）
+// 目标站点 + 路由 profiles（迁至 lib/sites.js，playwright-free）
 // ──────────────────────────────────────────────────────────
-const SITES = [
-    {
-        name: 'cun.ai',
-        baseUrl: 'https://www.cun.ai',
-        clientId: 'Ov23lipURdGRYDGN2jII',
-        tokenName: process.env.TOKEN_NAME || 'claude',
-        tokenUnlimitedQuota: process.env.TOKEN_UNLIMITED_QUOTA !== 'false',
-        tokenExpiredTime: parseInt(process.env.TOKEN_EXPIRED_TIME || '-1', 10),
-        tokenRemainQuota: parseInt(process.env.TOKEN_REMAIN_QUOTA || '0', 10),
-    },
-    {
-        name: 'a6api',
-        baseUrl: 'https://a6api.com',
-        clientId: 'Ov23ligFZ3T5H8HuvWO9',
-        tokenName: process.env.TOKEN_NAME || 'claude',
-        tokenUnlimitedQuota: process.env.TOKEN_UNLIMITED_QUOTA !== 'false',
-        tokenExpiredTime: parseInt(process.env.TOKEN_EXPIRED_TIME || '-1', 10),
-        tokenRemainQuota: parseInt(process.env.TOKEN_REMAIN_QUOTA || '0', 10),
-    },
-];
-// 可通过 SITE 环境变量限制只注册指定站点
-const siteFilterRaw = (process.env.SITE_LIST || process.env.SITE || '').trim();
-const siteFilters = siteFilterRaw
-    ? siteFilterRaw.split(',').map(s => s.trim()).filter(Boolean)
-    : [];
-const TARGET_SITES = siteFilters.length
-    ? SITES.filter(s => siteFilters.some(f => s.name.includes(f) || s.baseUrl.includes(f)))
-    : SITES;
-
-// Default routing profiles for a6api/cun.ai multi-key export
-const DEFAULT_ROUTING_PROFILES = [
-    { name: 'dynamic-cheap', routing_enabled: true, routing_preference: 'cheap', pricing_strategy: 'auto', routing_allow_fallback: true },
-    { name: 'dynamic-fast', routing_enabled: true, routing_preference: 'fast', pricing_strategy: 'auto', routing_allow_fallback: true },
-    { name: 'dynamic-stable', routing_enabled: true, routing_preference: 'stable', pricing_strategy: 'auto', routing_allow_fallback: true },
-    { name: 'dynamic-quality', routing_enabled: true, routing_preference: 'quality', pricing_strategy: 'auto', routing_allow_fallback: true },
-];
-
-// Parse ROUTING_PROFILES env (JSON array) or use default
-const routingProfiles = (() => {
-    const raw = (process.env.ROUTING_PROFILES || '').trim();
-    if (!raw) return DEFAULT_ROUTING_PROFILES;
-    try {
-        const parsed = JSON.parse(raw);
-        return Array.isArray(parsed) && parsed.length > 0 ? parsed : DEFAULT_ROUTING_PROFILES;
-    } catch (e) {
-        console.warn(`⚠️  ROUTING_PROFILES parse failed, using default: ${e.message}`);
-        return DEFAULT_ROUTING_PROFILES;
-    }
-})();
+const { SITES, TARGET_SITES, DEFAULT_ROUTING_PROFILES, resolveRoutingProfiles } = require('./lib/sites');
+const routingProfiles = resolveRoutingProfiles();
 
 // ──────────────────────────────────────────────────────────
 // 2. 姓名生成器（中文姓氏 + 西式名字 → 真人感邮箱）
@@ -160,10 +116,7 @@ function loadQQEmails() {
 let _usedEmails = new Set();
 
 function randomGithubUsername() {
-    const givenName = randomItem(GIVEN_NAMES).replace(/[^a-z0-9]/gi, '').toLowerCase();
-    const surname = randomItem(SURNAMES).replace(/[^a-z0-9]/gi, '').toLowerCase();
-    const num = Math.floor(1000 + Math.random() * 900000);
-    return `nsnzd-${givenName}${surname}${num}`.slice(0, 39).replace(/-+$/g, '');
+    return identityGen.generateUsername();
 }
 
 function assertSafeGithubUsername(username) {
@@ -201,8 +154,30 @@ async function fillExact(page, selector, value, label) {
     throw new Error(`exact_fill_failed_${label || 'field'}: ${actual} != ${expected}`);
 }
 
+async function detectEmailCollision(page) {
+    // GitHub shows an inline validation message under the email field when the
+    // address is already associated with an account. Poll briefly (validation is
+    // async/AJAX). Returns the matched message string, or '' when no collision.
+    const deadline = Date.now() + 4000;
+    const re = /already\s+(associated|taken|in use)|associated with an account|already\s+registered/i;
+    while (Date.now() < deadline) {
+        const texts = await page.locator(
+            '#email-err, #login-err, [role="alert"], .flash-error, .error, .form-group.errored .note'
+        ).allTextContents().catch(() => []);
+        const hit = texts.map(t => String(t || '').trim()).find(t => re.test(t));
+        if (hit) return hit;
+        // If the password container has already appeared, the email passed validation.
+        const advanced = await page.locator('input#password, input[name="user[password]"]')
+            .first().isVisible({ timeout: 250 }).catch(() => false);
+        if (advanced) return '';
+        await humanDelay(200, 400);
+    }
+    return '';
+}
+
 async function submitCreateAccountTwiceIfNeeded(page) {
     const submitBtn = page.locator('button[data-disable-invalid="true"]:has-text("Create account")').first();
+    await dismissGitHubCookieBanner(page);
     for (let attempt = 1; attempt <= 2; attempt++) {
         await submitBtn.waitFor({ state: 'visible', timeout: 30000 });
         await page.waitForFunction(() => {
@@ -210,6 +185,9 @@ async function submitCreateAccountTwiceIfNeeded(page) {
                 .find(b => /Create account/i.test(b.textContent || ''));
             return btn && !btn.disabled;
         }, { timeout: 10000 }).catch(() => {});
+        await dismissGitHubCookieBanner(page);
+        await submitBtn.evaluate(el => el.scrollIntoView({ block: 'center', inline: 'center' })).catch(() => {});
+        await humanDelay(150, 400);
         console.log(`  点击 Create account (${attempt}/2)...`);
         await humanClick(page, submitBtn);
         const jumped = await page.waitForFunction(
@@ -221,6 +199,7 @@ async function submitCreateAccountTwiceIfNeeded(page) {
             return true;
         }
         console.log(`  ⚠️ 第 ${attempt} 次点击后仍在: ${page.url()}`);
+        await dismissGitHubCookieBanner(page);
         await humanDelay(900, 2200);
     }
     return false;
@@ -230,26 +209,32 @@ function generateIdentity() {
     // Email may be specified by SIGNUP_EMAIL/CUSTOM_EMAIL, but GitHub username is always nsnzd-random.
     const customEmail = process.env.SIGNUP_EMAIL || process.env.CUSTOM_EMAIL || '';
     let email = customEmail;
+    // Persistent de-dup: seed used emails/usernames from results.jsonl + sessions.jsonl
+    // so restarts never regenerate an already-registered identity ("email already
+    // associated" collisions). In-memory _usedEmails guards within a single run.
+    const used = identityGen.loadUsed({ rootDir: __dirname });
+    for (const e of _usedEmails) used.emails.add(String(e).toLowerCase());
     if (!email) {
         const qq = loadQQEmails();
         if (qq.length > 0) {
-            const available = qq.filter(e => !_usedEmails.has(e));
-            if (available.length === 0) { _usedEmails.clear(); }
+            const available = qq.filter(e => !used.emails.has(String(e).toLowerCase()));
             email = available.length > 0 ? randomItem(available) : randomItem(qq);
-            _usedEmails.add(email);
         } else {
-            const surname = randomItem(SURNAMES);
-            const givenName = randomItem(GIVEN_NAMES);
-            email = `${givenName}.${surname}@${CONFIG.emailDomain}`;
+            email = identityGen.generateUniqueEmail(used, { domain: pickEmailDomain() });
         }
     }
-    if (!String(email).endsWith('@nsnzd.com')) {
-        throw new Error(`SIGNUP_EMAIL must be an nsnzd.com Mailops product email: ${email}`);
+    _usedEmails.add(email);
+    // 校验邮箱域名在白名单内（白名单 = CONFIG.emailDomains，16个mailops域名）
+    const emailLower = String(email).toLowerCase();
+    const domainOk = CONFIG.emailDomains.some(d => emailLower.endsWith(`@${d.toLowerCase()}`));
+    if (!domainOk) {
+        throw new Error(`SIGNUP_EMAIL domain not in whitelist (EMAIL_DOMAINS): ${email}`);
     }
     if (!CONFIG.defaultPassword) {
         throw new Error('DEFAULT_PASSWORD is required');
     }
-    const username = assertSafeGithubUsername(process.env.SIGNUP_USERNAME || randomGithubUsername());
+    const rawUsername = process.env.SIGNUP_USERNAME || identityGen.generateUniqueUsername(used);
+    const username = assertSafeGithubUsername(rawUsername);
     return { email, username, password: CONFIG.defaultPassword };
 }
 
@@ -275,8 +260,64 @@ function pickProxy() {
     return null;
 }
 
+// Return up to n DISTINCT random proxies from the pool (for failover). Falls back
+// to [CONFIG.proxy] when no pool, or [] when neither is set (caller adds direct).
+function pickProxies(n = 3) {
+    if (CONFIG.proxyList) {
+        const all = CONFIG.proxyList.split(',').map(s => s.trim()).filter(Boolean);
+        if (all.length > 0) {
+            // Fisher–Yates shuffle a copy, take first n.
+            const pool = all.slice();
+            for (let i = pool.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [pool[i], pool[j]] = [pool[j], pool[i]];
+            }
+            return pool.slice(0, Math.min(n, pool.length));
+        }
+    }
+    if (CONFIG.proxy) return [CONFIG.proxy];
+    return [];
+}
+
+function pickEmailDomain() {
+    const all = CONFIG.emailDomains;
+    if (all.length === 0) return 'nsnzd.com'; // 万一配置清空，fallback
+    return randomItem(all);
+}
+
 function maskProxy(proxyUrl) {
     return String(proxyUrl || '').replace(/:\/\/([^:@/]+):([^@/]+)@/, '://$1:***@');
+}
+
+async function dismissGitHubCookieBanner(page, opts = {}) {
+    const selectors = [
+        'button:has-text("Reject")',
+        'button:has-text("Reject optional cookies")',
+        'button:has-text("Decline")',
+        'button:has-text("Accept")',
+    ];
+    const timeout = opts.timeoutMs ?? 800;
+    const delay = opts.delay || humanDelay;
+
+    for (const selector of selectors) {
+        const button = page.locator(selector).first();
+        const visible = await button.isVisible({ timeout }).catch(() => false);
+        if (!visible) continue;
+        try {
+            await button.click({ force: true });
+        } catch (err) {
+            try {
+                await humanClick(page, button);
+            } catch (_) {
+                throw err;
+            }
+        }
+        if (!opts.quiet) console.log('  ✅ GitHub cookies 横幅已关闭');
+        await delay(150, 450);
+        return true;
+    }
+
+    return false;
 }
 
 function parseProxyForPlaywright(proxyUrl) {
@@ -292,6 +333,57 @@ function parseProxyForPlaywright(proxyUrl) {
     } catch (_) {
         return { server: trimmed };
     }
+}
+
+// Launch a persistent Chrome context bound to `proxyUrl` (null = direct). Returns
+// { context, page, proxyBridge, browserProxyUrl }. Caller closes context + bridge.
+// Used by registerGithubAccount's proxy-failover loop.
+async function launchBrowserForProxy(chromium, proxyUrl, userDataDir, viewport) {
+    let browserProxyUrl = proxyUrl;
+    let proxyBridge = null;
+    if (proxyUrl && /^socks5:\/\/[^@]+@/i.test(proxyUrl)) {
+        proxyBridge = await startAuthSocksBridge(proxyUrl);
+        browserProxyUrl = proxyBridge.url;
+        console.log(`[Proxy] 浏览器本地桥: ${browserProxyUrl} -> ${maskProxy(proxyUrl)}`);
+    }
+    const proxy = parseProxyForPlaywright(browserProxyUrl);
+
+    const launchOpts = {
+        headless: CONFIG.headless,
+        chromiumSandbox: false,
+        args: [
+            '--disable-blink-features=AutomationControlled',
+            '--no-sandbox',
+            '--disable-infobars',
+            '--no-first-run',
+            '--no-default-browser-check',
+            '--disable-dev-shm-usage',
+            '--disable-crashpad',
+        ],
+        viewport,
+        locale: 'en-US',
+        timezoneId: 'America/Los_Angeles',
+        userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
+        bypassCSP: false,
+    };
+    if (process.env.CHROMIUM_PATH) launchOpts.executablePath = process.env.CHROMIUM_PATH;
+    if (proxy) launchOpts.proxy = proxy;
+
+    const context = await chromium.launchPersistentContext(userDataDir, launchOpts);
+    const page = await context.newPage();
+    await page.addInitScript(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => false });
+        window.chrome = { runtime: {} };
+        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en', 'zh-CN'] });
+    });
+    return { context, page, proxyBridge, browserProxyUrl };
+}
+
+// True if an error looks like a proxy/connection failure worth failing over from.
+function isProxyConnError(err) {
+    const m = String((err && err.message) || err || '');
+    return /ERR_PROXY_CONNECTION_FAILED|ERR_SOCKS_CONNECTION_FAILED|ERR_TUNNEL_CONNECTION_FAILED|ERR_CONNECTION_(RESET|CLOSED|REFUSED|TIMED_OUT)|ERR_TIMED_OUT|ERR_EMPTY_RESPONSE|ERR_NAME_NOT_RESOLVED|socks|proxy/i.test(m);
 }
 
 // ──────────────────────────────────────────────────────────
@@ -498,29 +590,38 @@ async function ensureGithubLoggedIn(page, identity) {
 // ──────────────────────────────────────────────────────────
 // 6. 主流程
 // ──────────────────────────────────────────────────────────
-async function main() {
-    const startedAt = Date.now();
-    let identity = generateIdentity();
-    let savedGithubCookiePath = null;
+
+// Honor the server-side Python contract (scripts/oauth_dynamic_registrar.py passes
+// these env vars). Local runs set none of them → behavior is unchanged.
+function applyServerEnvContract() {
+    // Python points the persistent profile via PROFILE_DIR; index.js reads CHROME_PROFILE_DIR.
+    if (process.env.PROFILE_DIR && !process.env.CHROME_PROFILE_DIR) {
+        process.env.CHROME_PROFILE_DIR = process.env.PROFILE_DIR;
+    }
+    // Password may arrive as SIGNUP_PASSWORD; fold into CONFIG.defaultPassword.
+    if (!CONFIG.defaultPassword && process.env.SIGNUP_PASSWORD) {
+        CONFIG.defaultPassword = process.env.SIGNUP_PASSWORD;
+    }
+}
+
+// Phase 1-4: register a GitHub account (or fail) and return the LIVE browser handles
+// plus captured storageState. Does NOT write/delete cookie files and does NOT run
+// OAuth — the caller decides whether to continue to Phase 5 (main) or persist the
+// session and close (register-github.js). On failure it closes the context/bridge.
+//
+// Returns { identity, storageState, context, page, proxyUrl, proxyBridge }.
+async function registerGithubAccount(opts = {}) {
+    const { chromium } = require('playwright');
+    applyServerEnvContract();
+    let identity = opts.identity || generateIdentity();
 
     console.log('═══════════════════════════════════════════');
-    console.log('  GitHub 注册 + cun.ai OAuth 自动化');
+    console.log('  GitHub 注册（Stage A / Phase 1-4）');
     console.log('═══════════════════════════════════════════');
     console.log(`  邮箱:     ${identity.email}`);
     console.log(`  用户名:   ${identity.username}`);
     console.log(`  密码:     ${identity.password.replace(/./g, '*')}`);
     console.log('═══════════════════════════════════════════\n');
-
-    // ── 6.1 启动浏览器 ────────────────────────────────────
-    const proxyUrl = pickProxy();
-    let browserProxyUrl = proxyUrl;
-    let proxyBridge = null;
-    if (proxyUrl && /^socks5:\/\/[^@]+@/i.test(proxyUrl)) {
-        proxyBridge = await startAuthSocksBridge(proxyUrl);
-        browserProxyUrl = proxyBridge.url;
-        console.log(`[Proxy] 浏览器本地桥: ${browserProxyUrl} -> ${maskProxy(proxyUrl)}`);
-    }
-    const proxy = parseProxyForPlaywright(browserProxyUrl);
 
     // 随机 viewport（增加指纹多样性）
     const viewports = [
@@ -531,80 +632,91 @@ async function main() {
     ];
     const viewport = randomItem(viewports);
 
-    const userDataDir = path.join(__dirname, '.chrome-profile');
+    const userDataDir = process.env.CHROME_PROFILE_DIR || path.join(__dirname, '.chrome-profile');
 
-    const launchOpts = {
-        headless: CONFIG.headless,
-        chromiumSandbox: false,
-        // 优先使用系统 Chrome（无需 Playwright 自带 Chromium，避免 sandbox 解压失败）
-        // channel removed — use Playwright bundled Chromium
-        args: [
-            '--disable-blink-features=AutomationControlled',
-            '--no-sandbox',
-            '--disable-infobars',
-            '--no-first-run',
-            '--no-default-browser-check',
-            '--disable-dev-shm-usage',
-            '--disable-crashpad',
-        ],
-        viewport,
-        locale: 'en-US',
-        timezoneId: 'America/Los_Angeles',
-        userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
-        // 绕过 Chrome 的 ProcessSingleton 锁：使用项目目录下的 profile
-        bypassCSP: false,
-    };
-    if (process.env.CHROMIUM_PATH) {
-        launchOpts.executablePath = process.env.CHROMIUM_PATH;
+    // 清理旧 profile 避免 ProcessSingleton 冲突。
+    // OAUTH_ONLY / PRESERVE_PROFILE 时不清（服务器复用模式 PROFILE_DIR 指向已有 profile）。
+    if (!process.env.PRESERVE_PROFILE && process.env.OAUTH_ONLY !== 'true') {
+        try { fs.rmSync(userDataDir, { recursive: true, force: true }); } catch (_) {}
     }
-    if (proxy) {
-        launchOpts.proxy = proxy;
-    }
-
-    console.log('[Browser] 启动 Chrome (persistent context)...');
-    console.log(`  headless: ${CONFIG.headless}`);
-    console.log(`  proxy:    ${proxyUrl ? maskProxy(proxyUrl) : '直连'}`);
-    console.log(`  profile:  ${userDataDir}`);
-
-    // 清理旧 profile 避免 ProcessSingleton 冲突
-    try { fs.rmSync(userDataDir, { recursive: true, force: true }); } catch (_) {}
     fs.mkdirSync(userDataDir, { recursive: true });
 
-    let context = await chromium.launchPersistentContext(userDataDir, launchOpts);
-    let page = await context.newPage();
+    // ── 启动浏览器（代理故障转移：池里最多试 N 个 → 最后直连）────────
+    // 用首个 page.goto(signup) 作为连通性探针；代理连不上就换下一个候选。
+    const proxyRetries = parseInt(process.env.PROXY_RETRIES || '3', 10);
+    const candidates = [...pickProxies(proxyRetries), null]; // N 个代理 + 直连兜底
+    const SIGNUP_URL = 'https://github.com/signup?source=form-home-signup&user_email=';
 
-    // 注入反检测脚本（隐藏 webdriver 特征）
-    await page.addInitScript(() => {
-        Object.defineProperty(navigator, 'webdriver', { get: () => false });
-        // 伪造 chrome.runtime
-        window.chrome = { runtime: {} };
-        // 伪造 plugins 数量（headless Chrome 通常为 0）
-        Object.defineProperty(navigator, 'plugins', {
-            get: () => [1, 2, 3, 4, 5],
-        });
-        // 伪造 languages
-        Object.defineProperty(navigator, 'languages', {
-            get: () => ['en-US', 'en', 'zh-CN'],
-        });
-    });
+    let context = null, page = null, proxyBridge = null, browserProxyUrl = null, proxyUrl = null;
+    let launched = false;
+    for (let i = 0; i < candidates.length; i++) {
+        const cand = candidates[i];
+        const label = cand ? maskProxy(cand) : '直连';
+        const isLast = i === candidates.length - 1;
+        console.log(`\n[Browser] 启动 Chrome (persistent context) — 候选 ${i + 1}/${candidates.length}: ${label}`);
+        console.log(`  headless: ${CONFIG.headless} | profile: ${userDataDir}`);
+
+        let attempt;
+        try {
+            attempt = await launchBrowserForProxy(chromium, cand, userDataDir, viewport);
+        } catch (e) {
+            console.log(`  ⚠️ 候选 ${label} 启动失败: ${e.message}${isLast ? '' : ' → 换下一个'}`);
+            if (isLast) throw e;
+            continue;
+        }
+
+        // 连通性探针：首个 signup 页导航。
+        try {
+            console.log('\n━━━ 📝 Phase 1: GitHub 注册 ━━━');
+            await attempt.page.goto(SIGNUP_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+            // 成功：保留这套句柄，跳出循环继续后续流程。
+            context = attempt.context; page = attempt.page;
+            proxyBridge = attempt.proxyBridge; browserProxyUrl = attempt.browserProxyUrl;
+            proxyUrl = cand;
+            launched = true;
+            console.log(`  ✅ 连通 (${label})`);
+            break;
+        } catch (e) {
+            const proxyIssue = isProxyConnError(e);
+            console.log(`  ⚠️ 候选 ${label} 导航失败${proxyIssue ? '(代理连接问题)' : ''}: ${e.message}`);
+            // 拆掉这套失败句柄再试下一个。
+            await attempt.context.close().catch(() => {});
+            if (attempt.proxyBridge) await attempt.proxyBridge.close().catch(() => {});
+            if (isLast) throw e;                 // 直连也失败 → 抛出
+            if (!proxyIssue && !isLast) {
+                // 非代理问题（如页面/GitHub 侧异常），换代理也大概率无益，但仍按用户要求继续故障转移。
+                console.log('  （非代理类错误，仍继续故障转移）');
+            }
+            console.log('  → 换下一个候选');
+        }
+    }
+    if (!launched) throw new Error('all proxy candidates and direct connection failed');
 
     try {
-        // ── 6.2 GitHub 注册 ──────────────────────────────────
-        console.log('\n━━━ 📝 Phase 1: GitHub 注册 ━━━');
-
-        await page.goto('https://github.com/signup?source=form-home-signup&user_email=', {
-            waitUntil: 'domcontentloaded',
-            timeout: 60000,
-        });
         await humanDelay(1500, 4500);
+        await dismissGitHubCookieBanner(page);
 
         // ⚠️  GitHub 注册页面上方有 "Continue with Google/GitHub" 等社交登录按钮，
         //    它们也是 button[type="submit"]。必须精确定位邮箱注册表单的按钮，
         //    否则会误触发 Google OAuth 跳转。
 
-        // 6.2.1 填写邮箱 → 自动展露密码/用户名
+        // 6.2.1 填写邮箱 → 自动展露密码/用户名。
+        // GitHub 对 email 做即时校验，"already associated" 会内联报错并让表单保持无效。
+        // 这里在填邮箱后主动探测冲突，命中就换新邮箱重填（最多 EMAIL_RETRY 次），
+        // 避免走到最后才整轮失败。
         console.log('  [1/3] 填写邮箱...');
-        await fillExact(page, 'input#email, input[name="user[email]"]', identity.email, 'email');
+        const emailRetryMax = parseInt(process.env.EMAIL_COLLISION_RETRY || '5', 10);
+        for (let emailTry = 0; ; emailTry++) {
+            await fillExact(page, 'input#email, input[name="user[email]"]', identity.email, 'email');
+            const collision = await detectEmailCollision(page);
+            if (!collision) break;
+            if (emailTry >= emailRetryMax) {
+                throw new Error(`github_email_collision_exhausted after ${emailRetryMax} retries: ${collision}`);
+            }
+            const next = generateIdentity();
+            console.log(`  ⚠️ 邮箱冲突(${collision})，换新邮箱重试 ${emailTry + 1}/${emailRetryMax}: ${identity.email} → ${next.email}`);
+            identity = next;
+        }
 
         // 等待邮箱验证通过 → 密码字段出现（比等 Continue 按钮更快更准）
         console.log('  等待邮箱验证...');
@@ -648,7 +760,10 @@ async function main() {
             const errors = await page.locator('[role="alert"], .error, .flash-error, #signup-form-error').allTextContents().catch(() => []);
             if (errors.length > 0) console.log(`  GitHub 错误: ${errors.join('; ')}`);
             console.log(`  ❌ Create account 未成功，保存截图；不会点击 Google/Apple 登录按钮`);
-            await page.screenshot({ path: path.join(__dirname, 'captchas', 'signup-failed.png'), fullPage: true }).catch(() => {});
+            await page.screenshot({
+                path: process.env.SIGNUP_FAILED_SCREENSHOT_FILE || path.join(__dirname, 'captchas', 'signup-failed.png'),
+                fullPage: true,
+            }).catch(() => {});
             throw new Error('github_create_account_not_submitted');
         }
 
@@ -704,13 +819,19 @@ async function main() {
             if (otpRetry > 0) {
                 console.log(`  🔄 Mailops 重试 ${otpRetry}/3：关闭窗口，重新生成邮箱...`);
                 await context.close();
+                if (proxyBridge) await proxyBridge.close().catch(() => {});
                 identity = generateIdentity();
                 console.log(`  新邮箱: ${identity.email}`);
-                context = await chromium.launchPersistentContext(userDataDir, launchOpts);
-                page = context.pages()[0] || await context.newPage();
+                // 用同一个工作代理重启（已在故障转移循环里验证可用）。
+                const relaunch = await launchBrowserForProxy(chromium, proxyUrl, userDataDir, viewport);
+                context = relaunch.context;
+                page = relaunch.page;
+                proxyBridge = relaunch.proxyBridge;
+                browserProxyUrl = relaunch.browserProxyUrl;
                 // 重新走一遍注册流程
                 await page.goto('https://github.com/signup', { waitUntil: 'domcontentloaded', timeout: 30000 });
                 await humanDelay(1200, 3000);
+                await dismissGitHubCookieBanner(page);
                 await fillExact(page, 'input#email, input[name="user[email]"]', identity.email, 'email');
                 console.log('  等待邮箱验证...');
                 try { await page.waitForSelector('button[data-continue-to="password-container"]', { timeout: 30000 }); } catch (_) {}
@@ -754,35 +875,111 @@ async function main() {
         // 等待注册完成（跳转到 dashboard 或 login 页）
         await humanDelay(2000, 6000);
 
-        // ── 6.4 登录 GitHub（如果需要） ───────────────────────
+        // ── Phase 4: 确认登录状态 ─────────────────────────────
         console.log('\n━━━ 🔑 Phase 4: 确认登录状态 ━━━');
 
         await ensureGithubLoggedIn(page, identity);
 
-        // 保存 GitHub 登录 cookies，后续可用 oauth-only.js 只调试 Phase 5，避免重复注册账号。
-        try {
-            const cookiePath = process.env.GITHUB_COOKIES_FILE || path.join(__dirname, 'data', 'github-cookies.json');
-            fs.mkdirSync(path.dirname(cookiePath), { recursive: true });
-            fs.writeFileSync(cookiePath, JSON.stringify(await context.cookies('https://github.com'), null, 2));
-            savedGithubCookiePath = cookiePath;
-            console.log(`  ✅ GitHub cookies 已保存: ${cookiePath}`);
-        } catch (e) {
-            console.log(`  ⚠️ GitHub cookies 保存失败: ${e.message}`);
+        // 捕获完整 storageState（cookies + localStorage），供 Stage B / 持久化复用。
+        // 不再写/删 data/github-cookies.json。
+        const storageState = await context.storageState();
+
+        // 服务器契约：若设置 EXPORT_COOKIES_PATH，则把 storageState 落到该路径供 Python 消费。
+        if (process.env.EXPORT_COOKIES_PATH) {
+            try {
+                fs.mkdirSync(path.dirname(process.env.EXPORT_COOKIES_PATH), { recursive: true });
+                fs.writeFileSync(process.env.EXPORT_COOKIES_PATH, JSON.stringify(storageState, null, 2));
+                console.log(`  ✅ storageState 已导出: ${process.env.EXPORT_COOKIES_PATH}`);
+            } catch (e) {
+                console.log(`  ⚠️ storageState 导出失败: ${e.message}`);
+            }
         }
 
+        console.log(`  ✅ Stage A 完成，session 已捕获（${(storageState.cookies || []).length} cookies）`);
+        return { identity, storageState, context, page, proxyUrl: browserProxyUrl || proxyUrl || '', proxyBridge };
+    } catch (err) {
+        console.error(`\n❌ 注册阶段失败: ${err.message}`);
+        // 出错时关闭浏览器/代理桥；调用方拿到异常。
+        const errorScreenshot = process.env.ERROR_SCREENSHOT_FILE || path.join(__dirname, 'error.png');
+        try {
+            fs.mkdirSync(path.dirname(errorScreenshot), { recursive: true });
+            await page.screenshot({ path: errorScreenshot }).catch(() => {});
+        } catch (_) {}
+        await context.close().catch(() => {});
+        if (proxyBridge) await proxyBridge.close().catch(() => {});
+        throw err;
+    }
+}
+
+// OAUTH_ONLY=true path: skip registration, reuse an existing session's cookies and
+// run Phase 5 (OAuth) directly. Cookie source priority:
+//   (1) EXPORT_COOKIES_PATH file (server writes storageState/cookies here)
+//   (2) a session in sessions.jsonl matching SIGNUP_EMAIL
+// Returns the same result shape as main().
+async function runOAuthOnly(opts = {}) {
+    applyServerEnvContract();
+    const startedAt = opts.startedAt || Date.now();
+    let cookies = null;
+    let email = process.env.SIGNUP_EMAIL || '';
+    let username = email ? email.split('@', 1)[0] : '';
+    let password = CONFIG.defaultPassword;
+
+    const cookiePath = process.env.EXPORT_COOKIES_PATH || '';
+    if (cookiePath && fs.existsSync(cookiePath)) {
+        const parsed = JSON.parse(fs.readFileSync(cookiePath, 'utf8'));
+        cookies = Array.isArray(parsed) ? parsed : (parsed.cookies || []);
+        console.log(`  [OAUTH_ONLY] 从 ${cookiePath} 载入 ${cookies.length} cookies`);
+    } else if (email) {
+        const { findSession, getSessionCookies } = require('./lib/session-store');
+        const sess = findSession(email, { rootDir: __dirname });
+        if (!sess) throw new Error(`OAUTH_ONLY: no session/cookies for ${email}`);
+        cookies = getSessionCookies(sess);
+        username = sess.username || username;
+        password = sess.password || password;
+        console.log(`  [OAUTH_ONLY] 从 sessions.jsonl 载入 ${email} 的 ${cookies.length} cookies`);
+    } else {
+        throw new Error('OAUTH_ONLY requires EXPORT_COOKIES_PATH or SIGNUP_EMAIL');
+    }
+
+    const results = await runSitesOAuthHttp(TARGET_SITES, cookies, { proxyUrl: pickProxy() || '', routingProfiles });
+    const duration = ((Date.now() - startedAt) / 1000).toFixed(1);
+    const result = { success: true, email, username, password, keys: results, durationSeconds: parseFloat(duration) };
+    await uploadResult({ ...result, source: 'oauth-only' }, { meta: { source: 'index', mode: 'oauth-only' } });
+    console.log(JSON.stringify(result, null, 2));
+    return result;
+}
+
+// ──────────────────────────────────────────────────────────
+// 主流程：Stage A（注册）+ Phase 5（OAuth）+ Phase 6（结果）。
+// npm start 与服务器都跑 main()，行为与旧版一致（唯一变化：不再产 github-cookies.json）。
+// ──────────────────────────────────────────────────────────
+async function main() {
+    const startedAt = Date.now();
+
+    // OAUTH_ONLY=true：跳过注册，直接用已有 session/cookies 走 Phase 5。
+    if (process.env.OAUTH_ONLY === 'true') {
+        return runOAuthOnly({ startedAt });
+    }
+
+    const reg = await registerGithubAccount();
+    const { identity, storageState, context, proxyUrl } = reg;
+    const proxyBridge = reg.proxyBridge;
+
+    try {
         // ── 🚀 TURBO 模式：登录后的操作全速执行 ────────────────
         console.log('\n🚀 进入 TURBO 模式（登录后操作全速）');
         const turbo = { delay: (ms) => new Promise(r => setTimeout(r, ms || 100)) };
+        const page = reg.page;
 
-        // ── 6.5 多站 OAuth + Token（遍历 TARGET_SITES） ──────
+        // ── Phase 5: 多站 OAuth + Token（遍历 TARGET_SITES） ──────
         console.log(`\n━━━ 🔗 Phase 5: OAuth + Token (${TARGET_SITES.length} 站) ━━━`);
 
         let results = [];
 
         if (CONFIG.hybridHttpOAuth) {
             console.log('  模式: Hybrid HTTP OAuth（GitHub 注册保留浏览器，OAuth/Token 使用 HTTP）');
-            const githubCookies = await context.cookies();
-            results = await runSitesOAuthHttp(TARGET_SITES, githubCookies, { proxyUrl: browserProxyUrl || proxyUrl || '', routingProfiles });
+            const githubCookies = storageState.cookies || [];
+            results = await runSitesOAuthHttp(TARGET_SITES, githubCookies, { proxyUrl: proxyUrl || '', routingProfiles });
             for (const r of results) {
                 console.log(`  🎉 ${r.site} [${r.profile || 'default'}] Key: ${r.apiKey.substring(0, 12)}...`);
             }
@@ -790,6 +987,7 @@ async function main() {
             console.log('  模式: Browser OAuth fallback（HYBRID_HTTP_OAUTH=false）');
             for (const site of TARGET_SITES) {
                 console.log(`\n── ${site.name} ──────────────────────────────`);
+
 
                 // 1. 访问站点建立 session
                 console.log(`  建立 session...`);
@@ -917,7 +1115,7 @@ async function main() {
             }
         }
 
-        // ── 6.6 结果输出 ─────────────────────────────────────
+        // ── Phase 6: 结果输出 ─────────────────────────────────
         const duration = ((Date.now() - startedAt) / 1000).toFixed(1);
         console.log('\n═══════════════════════════════════════════');
         console.log('  🎉 注册完成!');
@@ -940,23 +1138,19 @@ async function main() {
             durationSeconds: parseFloat(duration),
         };
         await uploadResult({ ...result, source: 'fresh-registration' }, { meta: { source: 'index' } });
-        if (savedGithubCookiePath && process.env.KEEP_GITHUB_COOKIES !== 'true') {
-            fs.rmSync(savedGithubCookiePath, { force: true });
-            console.log(`  ✅ GitHub cookies 已消费并删除: ${savedGithubCookiePath}`);
-        }
         console.log(JSON.stringify(result, null, 2));
         return result;
 
     } catch (err) {
         console.error(`\n❌ 流程失败: ${err.message}`);
         console.error(err.stack);
-        if (savedGithubCookiePath && process.env.KEEP_GITHUB_COOKIES !== 'true') {
-            fs.rmSync(savedGithubCookiePath, { force: true });
-            console.log(`已删除失败流程 cookies: ${savedGithubCookiePath}`);
-        }
         // 截图保存现场
-        await page.screenshot({ path: path.join(__dirname, 'error.png') }).catch(() => {});
-        console.log('已保存错误截图: error.png');
+        const errorScreenshot = process.env.ERROR_SCREENSHOT_FILE || path.join(__dirname, 'error.png');
+        try {
+            fs.mkdirSync(path.dirname(errorScreenshot), { recursive: true });
+            await reg.page.screenshot({ path: errorScreenshot }).catch(() => {});
+            console.log(`已保存错误截图: ${errorScreenshot}`);
+        } catch (_) {}
         throw err;
     } finally {
         await context.close().catch(() => {});
@@ -979,4 +1173,4 @@ if (require.main === module) {
         });
 }
 
-module.exports = { main, generateIdentity, pollOTP, siteCreateToken, SITES, TARGET_SITES, randomGithubUsername, assertSafeGithubUsername, isGithubLoggedInUrl, ensureGithubLoggedIn };
+module.exports = { main, registerGithubAccount, runOAuthOnly, applyServerEnvContract, generateIdentity, pollOTP, siteCreateToken, SITES, TARGET_SITES, randomGithubUsername, assertSafeGithubUsername, isGithubLoggedInUrl, ensureGithubLoggedIn, dismissGitHubCookieBanner };

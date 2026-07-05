@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { runSiteOAuthHttp } = require('../lib/hybrid-oauth');
+const { runSiteOAuthHttp, runSitesOAuthHttp } = require('../lib/hybrid-oauth');
 
 test('runSiteOAuthHttp completes GitHub OAuth callback and creates target token over HTTP', async () => {
   const calls = [];
@@ -272,4 +272,33 @@ test('runSiteOAuthHttp includes token key response diagnostics when key fetch fa
     () => runSiteOAuthHttp({ name: 'cun.ai', baseUrl: 'https://www.cun.ai', clientId: 'CLIENT' }, [], { transport }),
     /token key fetch failed status=404 body=not found/
   );
+});
+
+test('runSitesOAuthHttp continues with later sites when one site fails', async () => {
+  const sites = [
+    { name: 'cun.ai', baseUrl: 'https://www.cun.ai' },
+    { name: 'a6api', baseUrl: 'https://a6api.com' },
+  ];
+
+  const results = await runSitesOAuthHttp(sites, [], {
+    runSiteFn: async (site) => {
+      if (site.name === 'cun.ai') throw new Error('cun user id 401');
+      return {
+        site: site.name,
+        baseUrl: site.baseUrl,
+        userId: '42',
+        keys: [{ apiKey: 'sk-ok', profile: 'dynamic-fast' }],
+      };
+    },
+  });
+
+  assert.deepEqual(results, [
+    {
+      site: 'a6api',
+      baseUrl: 'https://a6api.com',
+      userId: '42',
+      apiKey: 'sk-ok',
+      profile: 'dynamic-fast',
+    },
+  ]);
 });
