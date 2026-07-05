@@ -11,7 +11,8 @@
     "headless": "HEADLESS=true node index.js",
     "test": "node --test",
     "oauth": "node oauth-only.js",
-    "register:upload": "node register-upload-api-nsnzd.js"
+    "register:upload": "node register-upload-api-nsnzd.js",
+    "watch:pool": "node pool-watcher.js"
   },
   "engines": {
     "node": ">=20"
