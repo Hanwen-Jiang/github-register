@@ -44,7 +44,7 @@ test('runSiteOAuthHttp completes GitHub OAuth callback and creates target token 
       assert.equal(opts.headers['new-api-user'], '42');
       return { status: 200, headers: {}, text: () => '{"success":true}', json: () => ({ success: true }) };
     }
-    if (url === 'https://www.cun.ai/api/token/?p=1&size=20') {
+    if (url === 'https://www.cun.ai/api/token/?p=1&size=100') {
       return { status: 200, headers: {}, text: () => '{"data":{"items":[{"id":7,"name":"claude","created_time":10}]}}', json: () => ({ data: { items: [{ id: 7, name: 'claude', created_time: 10 }] } }) };
     }
     if (url === 'https://www.cun.ai/api/token/7/key') {
@@ -71,7 +71,7 @@ test('runSiteOAuthHttp completes GitHub OAuth callback and creates target token 
     'https://www.cun.ai/dashboard',
     'https://www.cun.ai/api/user/self',
     'https://www.cun.ai/api/token/',
-    'https://www.cun.ai/api/token/?p=1&size=20',
+    'https://www.cun.ai/api/token/?p=1&size=100',
     'https://www.cun.ai/api/token/7/key',
   ]);
 });
@@ -185,7 +185,7 @@ test('runSiteOAuthHttp follows callback link from GitHub OAuth authorized HTML p
     };
     if (url === 'https://www.cun.ai/api/user/self') return { status: 200, headers: {}, text: () => '{"data":{"id":42}}', json: () => ({ data: { id: 42 } }) };
     if (url === 'https://www.cun.ai/api/token/') return { status: 200, headers: {}, text: () => '{"success":true}', json: () => ({ success: true }) };
-    if (url === 'https://www.cun.ai/api/token/?p=1&size=20') return { status: 200, headers: {}, text: () => '{"data":{"items":[{"id":7,"created_time":1}]}}', json: () => ({ data: { items: [{ id: 7, created_time: 1 }] } }) };
+    if (url === 'https://www.cun.ai/api/token/?p=1&size=100') return { status: 200, headers: {}, text: () => '{"data":{"items":[{"id":7,"name":"claude","created_time":1}]}}', json: () => ({ data: { items: [{ id: 7, name: 'claude', created_time: 1 }] } }) };
     if (url === 'https://www.cun.ai/api/token/7/key') return { status: 200, headers: {}, text: () => '{"success":true,"data":{"key":"abc"}}', json: () => ({ success: true, data: { key: 'abc' } }) };
     throw new Error(`unexpected ${url}`);
   };
@@ -220,7 +220,7 @@ test('runSiteOAuthHttp calls target OAuth API after extracting SPA callback URL'
     };
     if (url === 'https://www.cun.ai/api/user/self') return { status: 200, headers: {}, text: () => '{"data":{"id":42}}', json: () => ({ data: { id: 42 } }) };
     if (url === 'https://www.cun.ai/api/token/') return { status: 200, headers: {}, text: () => '{"success":true}', json: () => ({ success: true }) };
-    if (url === 'https://www.cun.ai/api/token/?p=1&size=20') return { status: 200, headers: {}, text: () => '{"data":{"items":[{"id":7,"created_time":1}]}}', json: () => ({ data: { items: [{ id: 7, created_time: 1 }] } }) };
+    if (url === 'https://www.cun.ai/api/token/?p=1&size=100') return { status: 200, headers: {}, text: () => '{"data":{"items":[{"id":7,"name":"claude","created_time":1}]}}', json: () => ({ data: { items: [{ id: 7, name: 'claude', created_time: 1 }] } }) };
     if (url === 'https://www.cun.ai/api/token/7/key') return { status: 200, headers: {}, text: () => '{"success":true,"data":{"key":"abc"}}', json: () => ({ success: true, data: { key: 'abc' } }) };
     throw new Error(`unexpected ${url}`);
   };
@@ -247,7 +247,7 @@ test('runSiteOAuthHttp reuses user id returned by target OAuth API callback', as
       assert.equal(opts.headers['new-api-user'], '9202');
       return { status: 200, headers: {}, text: () => '{"success":true}', json: () => ({ success: true }) };
     }
-    if (url === 'https://www.cun.ai/api/token/?p=1&size=20') return { status: 200, headers: {}, text: () => '{"data":{"items":[{"id":7,"created_time":1}]}}', json: () => ({ data: { items: [{ id: 7, created_time: 1 }] } }) };
+    if (url === 'https://www.cun.ai/api/token/?p=1&size=100') return { status: 200, headers: {}, text: () => '{"data":{"items":[{"id":7,"name":"claude","created_time":1}]}}', json: () => ({ data: { items: [{ id: 7, name: 'claude', created_time: 1 }] } }) };
     if (url === 'https://www.cun.ai/api/token/7/key') return { status: 200, headers: {}, text: () => '{"success":true,"data":{"key":"abc"}}', json: () => ({ success: true, data: { key: 'abc' } }) };
     if (url === 'https://www.cun.ai/api/user/self') throw new Error('self should not be called when callback returned user id');
     throw new Error(`unexpected ${url}`);
@@ -264,7 +264,7 @@ test('runSiteOAuthHttp includes token key response diagnostics when key fetch fa
     if (url.startsWith('https://github.com/login/oauth/authorize?')) return { status: 302, headers: { location: 'https://www.cun.ai/oauth/github?code=C&state=STATE123' }, text: () => '', json: () => null };
     if (url === 'https://www.cun.ai/api/oauth/github?code=C&state=STATE123') return { status: 200, headers: {}, text: () => '{"success":true,"data":{"id":42}}', json: () => ({ success: true, data: { id: 42 } }) };
     if (url === 'https://www.cun.ai/api/token/') return { status: 200, headers: {}, text: () => '{"success":true}', json: () => ({ success: true }) };
-    if (url === 'https://www.cun.ai/api/token/?p=1&size=20') return { status: 200, headers: {}, text: () => '{"data":{"items":[{"id":7,"created_time":1}]}}', json: () => ({ data: { items: [{ id: 7, created_time: 1 }] } }) };
+    if (url === 'https://www.cun.ai/api/token/?p=1&size=100') return { status: 200, headers: {}, text: () => '{"data":{"items":[{"id":7,"name":"claude","created_time":1}]}}', json: () => ({ data: { items: [{ id: 7, name: 'claude', created_time: 1 }] } }) };
     if (url === 'https://www.cun.ai/api/token/7/key') return { status: 404, headers: {}, text: () => 'not found', json: () => null };
     throw new Error(`unexpected ${url}`);
   };
