@@ -39,6 +39,8 @@ async function main(opts = {}) {
       username: reg.identity.username,
       password: reg.identity.password,
       proxy_url: reg.proxyUrl || '',
+      upstream_proxy_url: reg.upstreamProxyUrl || reg.proxyUrl || '',
+      browser_proxy_url: reg.browserProxyUrl || '',
       storage_state: reg.storageState,
       sites_registered: {},
       status: 'active',

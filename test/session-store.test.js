@@ -131,6 +131,45 @@ test('findReusableSession returns null when none eligible', () => {
   assert.equal(store.findReusableSession('a6api', o), null);
 });
 
+test('findAvailableSession falls back to active GitHub-only sessions', () => {
+  const o = tmp();
+  store.appendSession(baseRecord({
+    email: 'fresh@nsnzd.com',
+    storage_state: { cookies: [{ name: 'user_session', value: 'abc', domain: '.github.com', path: '/' }], origins: [] },
+    sites_registered: {},
+    last_result_keys: 0,
+    empty_keys: true,
+  }), o);
+
+  const pick = store.findAvailableSession('cun.ai', o);
+  assert.ok(pick);
+  assert.equal(pick.email, 'fresh@nsnzd.com');
+});
+
+test('findAvailableSession prefers reusable lead sessions before empty sessions', () => {
+  const o = tmp();
+  store.appendSession(baseRecord({
+    email: 'fresh@nsnzd.com',
+    created_at: '2026-07-01T00:00:00Z',
+    last_used_at: '2026-07-01T00:00:00Z',
+    sites_registered: {},
+    last_result_keys: 0,
+    empty_keys: true,
+  }), o);
+  store.appendSession(baseRecord({
+    email: 'lead@nsnzd.com',
+    created_at: '2026-07-05T00:00:00Z',
+    last_used_at: '2026-07-05T00:00:00Z',
+    sites_registered: { 'cun.ai': { account_id: 1, keys: [{ apiKey: 'sk' }] } },
+    last_result_keys: 1,
+    empty_keys: false,
+  }), o);
+
+  const pick = store.findAvailableSession('a6api', o);
+  assert.ok(pick);
+  assert.equal(pick.email, 'lead@nsnzd.com');
+});
+
 test('compactSessions collapses append-only duplicates to latest', () => {
   const o = tmp();
   store.appendSession(baseRecord({ status: 'active' }), o);
@@ -140,4 +179,19 @@ test('compactSessions collapses append-only duplicates to latest', () => {
   assert.equal(kept, 1);
   assert.equal(store.listSessionsRaw(o).length, 1);
   assert.equal(store.findSession('a@nsnzd.com', o).status, 'exhausted');
+});
+
+test('quarantineSuspendedSession marks latest session and writes isolated suspended file', () => {
+  const o = tmp();
+  store.appendSession(baseRecord({ status: 'active' }), o);
+
+  const out = store.quarantineSuspendedSession('a@nsnzd.com', { last_error: 'Account suspended' }, o);
+
+  assert.equal(out.status, 'github_suspended');
+  assert.ok(out.suspended_at);
+  assert.equal(store.findSession('a@nsnzd.com', o).status, 'github_suspended');
+  const suspended = store.listSuspendedSessions(o);
+  assert.equal(suspended.length, 1);
+  assert.equal(suspended[0].email, 'a@nsnzd.com');
+  assert.equal(suspended[0].last_error, 'Account suspended');
 });

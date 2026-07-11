@@ -2,12 +2,13 @@
 //
 // 零浏览器。http.request + 自研 SOCKS5 agent。2Captcha 自动求解 Funcaptcha。
 //
-// 用法: PROXY=socks5://127.0.0.1:2080 CAPTCHA_API_KEY=xxx node curl-register.js
+// 用法: PROXY=socks5://user:pass@host:port CAPTCHA_API_KEY=xxx node curl-register.js
 
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { init, socksRequest } = require('./socks-agent');
+const { tokenEnvDefaults, cunAiTokenEnvDefaults, resolveTokenRemainQuota, resolveTokenUnlimitedQuota } = require('./lib/token-defaults');
 
 // ══════════════════════════════════════════════════════════
 // Config
@@ -36,20 +37,29 @@ const DOMAIN = process.env.EMAIL_DOMAIN || 'nsnzd.com';
 const PASS = process.env.DEFAULT_PASSWORD || '';
 if (!PASS) throw new Error('DEFAULT_PASSWORD is required');
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36';
-const PROXY_URL = process.env.PROXY || 'socks5://127.0.0.1:2080';
+const PROXY_URL = process.env.PROXY || '';
 
-init(PROXY_URL);
-console.log(`[Proxy] ${maskProxy(PROXY_URL)}`);
+if (PROXY_URL) {
+    init(PROXY_URL);
+    console.log(`[Proxy] ${maskProxy(PROXY_URL)}`);
+} else {
+    console.log('[Proxy] 直连（未设置 PROXY）');
+}
+
+async function request(url, opts = {}) {
+    if (PROXY_URL) return socksRequest(url, opts);
+    return fetch(url, opts);
+}
 
 const SITES = [
-    { name: 'cun.ai', base: 'https://www.cun.ai', clientId: 'Ov23lipURdGRYDGN2jII' },
-    { name: 'a6api',  base: 'https://a6api.com',  clientId: 'Ov23ligFZ3T5H8HuvWO9' },
+    { name: 'cun.ai', base: 'https://www.cun.ai', clientId: 'Ov23lipURdGRYDGN2jII', ...cunAiTokenEnvDefaults(process.env, 'claude') },
+    { name: 'a6api',  base: 'https://a6api.com',  clientId: 'Ov23ligFZ3T5H8HuvWO9', ...tokenEnvDefaults(process.env, 'claude') },
 ];
 const TARGET = (process.env.SITE || '').trim()
     ? SITES.filter(s => s.name.includes(process.env.SITE) || s.base.includes(process.env.SITE))
     : SITES;
 
-// proxy initialized via socks-agent.js init() above
+// PROXY 有值就走 socks-agent；没值就直连 fetch。
 
 // ══════════════════════════════════════════════════════════
 // HTTP helpers (http.request + SOCKS5 agent)
@@ -73,7 +83,7 @@ class CookieJar {
 async function hGet(url, jar, extraHdrs = {}) {
     const headers = { 'user-agent': UA, 'accept': 'text/html,application/xhtml+xml', 'accept-language': 'en-US,en;q=0.9', ...extraHdrs };
     if (jar && jar.toString()) headers['cookie'] = jar.toString();
-    const resp = await socksRequest(url, { headers });
+    const resp = await request(url, { headers });
     if (jar) jar.load(resp.headers);
     return resp;
 }
@@ -86,7 +96,7 @@ async function hPost(url, jar, body, extraHdrs = {}, isForm = true) {
     };
     if (jar && jar.toString()) headers['cookie'] = jar.toString();
     const bodyStr = isForm ? new URLSearchParams(body).toString() : JSON.stringify(body);
-    const resp = await socksRequest(url, { method: 'POST', headers, body: bodyStr });
+    const resp = await request(url, { method: 'POST', headers, body: bodyStr });
     if (jar) jar.load(resp.headers);
     return resp;
 }
@@ -131,7 +141,7 @@ async function pollOTP(email) {
     for (let i = 0; i < 40; i++) {
         await new Promise(r => setTimeout(r, 3000));
         try {
-            const r = await socksRequest(`${MAILOPS}/admin/api/v1/otp-records?recipient_address=${enc}&page=1&page_size=5`, {
+            const r = await request(`${MAILOPS}/admin/api/v1/otp-records?recipient_address=${enc}&page=1&page_size=5`, {
                 headers: { 'Authorization': `Bearer ${MAILOPS_TOKEN}` },
             });
             const items = r.json()?.data?.items || [];
@@ -267,7 +277,10 @@ async function siteOAuth(site, ghJar) {
     const ah = { 'new-api-user': String(userId), 'origin': site.base, 'referer': `${site.base}/keys` };
 
     const cr = await hPost(`${site.base}/api/token/`, null, {
-        name: 'claude', remain_quota: 0, expired_time: -1, unlimited_quota: true,
+        name: site.tokenName || 'claude',
+        remain_quota: resolveTokenRemainQuota(site),
+        expired_time: site.tokenExpiredTime ?? -1,
+        unlimited_quota: resolveTokenUnlimitedQuota(site),
         model_limits_enabled: false, model_limits: '', allow_ips: '', group: 'default', cross_group_retry: false,
     }, ah, false);
     const cd = cr.json();

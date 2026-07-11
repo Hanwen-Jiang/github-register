@@ -9,14 +9,18 @@
     "start": "node index.js",
     "dev": "HEADLESS=false node index.js",
     "headless": "HEADLESS=true node index.js",
-    "test": "node --test",
+    "test": "node --test --test-concurrency=1",
     "register": "node register-github.js",
+    "sessions": "node list-sessions.js",
     "oauth:site": "node oauth-site.js",
+    "oauth:site:batch": "node oauth-site-batch.js",
     "oauth": "node oauth-only.js",
     "register:upload": "node register-upload-api-nsnzd.js",
     "register:batch": "node batch-register-upload.js",
     "register:upload-retry": "node register-upload-retry.js",
-    "watch:pool": "node pool-watcher.js"
+    "watch:pool": "node pool-watcher.js",
+    "sessions:refresh": "node refresh-github-sessions.js",
+    "sessions:quarantine-suspended": "node quarantine-suspended-sessions.js"
   },
   "engines": {
     "node": ">=20"

@@ -33,3 +33,24 @@ test('reuploadUnuploaded uploads only results missing from the ledger and marks 
   assert.deepEqual(seenProxyIds, [6, 7, 8]);
   assert.ok(loadUploadedIds(ledgerFile).has('r2'));
 });
+
+test('reuploadUnuploaded returns early when there is nothing missing', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'reupload-empty-'));
+  const resultsFile = path.join(dir, 'results.jsonl');
+  const ledgerFile = path.join(dir, 'uploaded.jsonl');
+
+  const r1 = { source: 'r1', username: 'u1', keys: [{ site: 'a6api', baseUrl: 'https://a6api.com', apiKey: 'sk-1' }] };
+  fs.writeFileSync(resultsFile, `${JSON.stringify(r1)}\n`);
+  markUploaded(r1, { ledgerFile });
+
+  const res = await reuploadUnuploaded({
+    resultsFile,
+    ledgerFile,
+    adminKey: 'admin-test',
+    resolveGroupIdFn: async () => { throw new Error('group lookup should not run'); },
+    resolveProxyIdsFn: async () => { throw new Error('proxy lookup should not run'); },
+  });
+
+  assert.deepEqual(res, { attempted: 0, succeeded: 0, failed: 0 });
+});
+

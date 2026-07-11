@@ -24,6 +24,7 @@ const { runSitesOAuthHttp } = require('./lib/hybrid-oauth');
 const { uploadResult } = require('./lib/result-uploader');
 const { saveGithubSession, shouldDeleteGithubCookies } = require('./lib/cookie-store');
 const identityGen = require('./lib/identity');
+const { DEFAULT_TOKEN_REMAIN_QUOTA, DEFAULT_TOKEN_UNLIMITED_QUOTA, parseBoolEnv, parseIntEnv, resolveTokenRemainQuota, resolveTokenUnlimitedQuota } = require('./lib/token-defaults');
 const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
@@ -61,9 +62,9 @@ const CONFIG = {
     proxy: process.env.PROXY || '',
     proxyList: process.env.PROXY_LIST || '',
     tokenName: process.env.TOKEN_NAME || 'claude',
-    tokenUnlimitedQuota: process.env.TOKEN_UNLIMITED_QUOTA !== 'false',
-    tokenExpiredTime: parseInt(process.env.TOKEN_EXPIRED_TIME || '-1', 10),
-    tokenRemainQuota: parseInt(process.env.TOKEN_REMAIN_QUOTA || '0', 10),
+    tokenUnlimitedQuota: parseBoolEnv(process.env.TOKEN_UNLIMITED_QUOTA, DEFAULT_TOKEN_UNLIMITED_QUOTA),
+    tokenExpiredTime: parseIntEnv(process.env.TOKEN_EXPIRED_TIME, -1),
+    tokenRemainQuota: parseIntEnv(process.env.TOKEN_REMAIN_QUOTA, DEFAULT_TOKEN_REMAIN_QUOTA),
     hybridHttpOAuth: process.env.HYBRID_HTTP_OAUTH !== 'false',
 };
 
@@ -179,7 +180,7 @@ function randomGithubUsername() {
 
 function assertSafeGithubUsername(username) {
     const u = String(username || '').trim().toLowerCase();
-    if (!u.startsWith('nsnzd-')) throw new Error(`unsafe_github_username_must_start_nsnzd: ${username}`);
+    if (u.startsWith('nsnzd-')) throw new Error(`unsafe_github_username_forbidden_nsnzd_prefix: ${username}`);
     if (/^(a6|a6a|a6api|cun|cun-ai|cun\.ai)$/i.test(u) || /^(nsnzd-)?(a6|a6a|a6api|cun|cun-ai)$/i.test(u)) {
         throw new Error(`unsafe_github_username_site_prefix: ${username}`);
     }
@@ -264,7 +265,7 @@ async function submitCreateAccountTwiceIfNeeded(page) {
 }
 
 function generateIdentity() {
-    // Email may be specified by SIGNUP_EMAIL/CUSTOM_EMAIL, but GitHub username is always nsnzd-random.
+    // Email may be specified by SIGNUP_EMAIL/CUSTOM_EMAIL, but GitHub username is always non-nsnzd random.
     const customEmail = process.env.SIGNUP_EMAIL || process.env.CUSTOM_EMAIL || '';
     let email = customEmail;
     // Persistent de-dup: seed used emails/usernames from results.jsonl + sessions.jsonl
@@ -410,6 +411,25 @@ function parseProxyForPlaywright(proxyUrl) {
     }
 }
 
+function resolveChromiumExecutablePath(opts = {}) {
+    const env = opts.env || process.env;
+    const exists = opts.exists || fs.existsSync;
+    const candidates = [
+        env.CHROMIUM_PATH,
+        '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+        '/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary',
+        '/Applications/Chromium.app/Contents/MacOS/Chromium',
+        'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+        'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+    ].filter(Boolean);
+    for (const candidate of candidates) {
+        try {
+            if (exists(candidate)) return candidate;
+        } catch (_) {}
+    }
+    return '';
+}
+
 // Launch a persistent Chrome context bound to `proxyUrl` (null = direct). Returns
 // { context, page, proxyBridge, browserProxyUrl }. Caller closes context + bridge.
 // Used by registerGithubAccount's proxy-failover loop.
@@ -441,7 +461,13 @@ async function launchBrowserForProxy(chromium, proxyUrl, userDataDir, viewport) 
         userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
         bypassCSP: false,
     };
-    if (process.env.CHROMIUM_PATH) launchOpts.executablePath = process.env.CHROMIUM_PATH;
+    const executablePath = resolveChromiumExecutablePath();
+    if (executablePath) {
+        launchOpts.executablePath = executablePath;
+        if (!process.env.CHROMIUM_PATH && executablePath.includes('Google Chrome')) {
+            console.log(`[Browser] 使用系统 Chrome: ${executablePath}`);
+        }
+    }
     if (proxy) launchOpts.proxy = proxy;
 
     const context = await chromium.launchPersistentContext(userDataDir, launchOpts);
@@ -453,6 +479,23 @@ async function launchBrowserForProxy(chromium, proxyUrl, userDataDir, viewport) 
         Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en', 'zh-CN'] });
     });
     return { context, page, proxyBridge, browserProxyUrl };
+}
+
+function isLocalhostProxyUrl(proxyUrl) {
+    if (!proxyUrl) return false;
+    try {
+        const u = new URL(proxyUrl);
+        const host = u.hostname.toLowerCase();
+        return host === '127.0.0.1' || host === 'localhost' || host === '::1';
+    } catch (_) {
+        return false;
+    }
+}
+
+function resolveReusableProxyUrl({ proxyUrl, browserProxyUrl } = {}) {
+    if (proxyUrl && !isLocalhostProxyUrl(proxyUrl)) return proxyUrl;
+    if (browserProxyUrl && !isLocalhostProxyUrl(browserProxyUrl)) return browserProxyUrl;
+    return '';
 }
 
 // True if an error looks like a proxy/connection failure worth failing over from.
@@ -562,13 +605,13 @@ async function siteCreateToken(site, sessionCookie, userId, profile = null) {
 
     const createBody = {
         name: profile ? `${profile.name}-${site.tokenName || 'claude'}` : (site.tokenName || 'claude'),
-        remain_quota: site.tokenRemainQuota ?? 0,
+        remain_quota: resolveTokenRemainQuota(site),
         expired_time: site.tokenExpiredTime ?? -1,
-        unlimited_quota: site.tokenUnlimitedQuota ?? true,
+        unlimited_quota: resolveTokenUnlimitedQuota(site),
         model_limits_enabled: false,
         model_limits: '',
         allow_ips: '',
-        group: 'default',
+        group: site.tokenGroup ?? 'default',
         cross_group_retry: false,
         // Routing fields (only if profile provided)
         ...(profile ? {
@@ -988,7 +1031,17 @@ async function registerGithubAccount(opts = {}) {
         }
 
         console.log(`  ✅ Stage A 完成，session 已捕获（${(storageState.cookies || []).length} cookies）`);
-        return { identity, storageState, context, page, proxyUrl: browserProxyUrl || proxyUrl || '', proxyBridge, savedGithubCookiePaths };
+        return {
+            identity,
+            storageState,
+            context,
+            page,
+            proxyUrl: resolveReusableProxyUrl({ proxyUrl, browserProxyUrl }),
+            browserProxyUrl: browserProxyUrl || '',
+            upstreamProxyUrl: proxyUrl || '',
+            proxyBridge,
+            savedGithubCookiePaths,
+        };
     } catch (err) {
         console.error(`\n❌ 注册阶段失败: ${err.message}`);
         // 出错时关闭浏览器/代理桥；调用方拿到异常。
@@ -1278,4 +1331,4 @@ if (require.main === module) {
         });
 }
 
-module.exports = { main, registerGithubAccount, runOAuthOnly, applyServerEnvContract, generateIdentity, reserveEmail, buildRandomNsnzdEmail, pollOTP, siteCreateToken, SITES, TARGET_SITES, randomGithubUsername, assertSafeGithubUsername, isGithubLoggedInUrl, ensureGithubLoggedIn, dismissGitHubCookieBanner };
+module.exports = { main, registerGithubAccount, runOAuthOnly, applyServerEnvContract, generateIdentity, reserveEmail, buildRandomNsnzdEmail, pollOTP, siteCreateToken, SITES, TARGET_SITES, randomGithubUsername, assertSafeGithubUsername, isGithubLoggedInUrl, ensureGithubLoggedIn, dismissGitHubCookieBanner, resolveReusableProxyUrl, resolveChromiumExecutablePath };

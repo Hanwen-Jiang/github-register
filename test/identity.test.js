@@ -66,11 +66,12 @@ test('generateUniqueEmail avoids used addresses', () => {
   }
 });
 
-test('generateUniqueUsername avoids used names and stays in safe format', () => {
+test('generateUniqueUsername avoids used names, stays safe, and never uses nsnzd prefix', () => {
   const used = { emails: new Set(), usernames: new Set() };
   for (let i = 0; i < 200; i++) {
     const name = id.generateUniqueUsername(used);
-    assert.match(name, /^nsnzd-[a-z0-9]+$/, `unsafe: ${name}`);
+    assert.match(name, /^[a-z][a-z0-9-]{2,38}$/, `unsafe: ${name}`);
+    assert.ok(!name.toLowerCase().startsWith('nsnzd-'), `forbidden nsnzd prefix: ${name}`);
     assert.ok(name.length <= 39);
     assert.ok(!used.usernames.has(name.toLowerCase()));
     used.usernames.add(name.toLowerCase());

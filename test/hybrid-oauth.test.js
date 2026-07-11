@@ -196,6 +196,7 @@ test('runSiteOAuthHttp follows callback link from GitHub OAuth authorized HTML p
 
 test('runSiteOAuthHttp calls target OAuth API after extracting SPA callback URL', async () => {
   const calls = [];
+  let capturedPayload = null;
   const transport = async (url, opts) => {
     calls.push(url);
     if (url === 'https://www.cun.ai/sign-in') return { status: 200, headers: {}, text: () => '', json: () => null };
@@ -219,14 +220,21 @@ test('runSiteOAuthHttp calls target OAuth API after extracting SPA callback URL'
       json: () => ({ success: true, data: { id: 42 } }),
     };
     if (url === 'https://www.cun.ai/api/user/self') return { status: 200, headers: {}, text: () => '{"data":{"id":42}}', json: () => ({ data: { id: 42 } }) };
-    if (url === 'https://www.cun.ai/api/token/') return { status: 200, headers: {}, text: () => '{"success":true}', json: () => ({ success: true }) };
+    if (url === 'https://www.cun.ai/api/token/') {
+      capturedPayload = JSON.parse(opts.body);
+      return { status: 200, headers: {}, text: () => '{"success":true}', json: () => ({ success: true }) };
+    }
     if (url === 'https://www.cun.ai/api/token/?p=1&size=100') return { status: 200, headers: {}, text: () => '{"data":{"items":[{"id":7,"name":"claude","created_time":1}]}}', json: () => ({ data: { items: [{ id: 7, name: 'claude', created_time: 1 }] } }) };
     if (url === 'https://www.cun.ai/api/token/7/key') return { status: 200, headers: {}, text: () => '{"success":true,"data":{"key":"abc"}}', json: () => ({ success: true, data: { key: 'abc' } }) };
     throw new Error(`unexpected ${url}`);
   };
-  const result = await runSiteOAuthHttp({ name: 'cun.ai', baseUrl: 'https://www.cun.ai', clientId: 'CLIENT' }, [], { transport });
+  const { SITES } = require('../lib/sites');
+  const cunAi = { ...SITES.find(s => s.name === 'cun.ai'), clientId: 'CLIENT' };
+  const result = await runSiteOAuthHttp(cunAi, [], { transport, random: () => 0 });
   assert.equal(result.keys[0].apiKey, 'sk-abc');
   assert.ok(calls.includes('https://www.cun.ai/api/oauth/github?code=SECRET_CODE&state=STATE123'));
+  assert.equal(capturedPayload.unlimited_quota, false);
+  assert.equal(capturedPayload.remain_quota, 10_500_000);
 });
 
 test('runSiteOAuthHttp reuses user id returned by target OAuth API callback', async () => {
@@ -254,6 +262,37 @@ test('runSiteOAuthHttp reuses user id returned by target OAuth API callback', as
   };
   const result = await runSiteOAuthHttp({ name: 'cun.ai', baseUrl: 'https://www.cun.ai', clientId: 'CLIENT' }, [], { transport });
   assert.equal(result.userId, '9202');
+  assert.equal(result.keys[0].apiKey, 'sk-abc');
+});
+
+test('runSiteOAuthHttp honors site tokenGroup override when creating token', async () => {
+  let capturedPayload = null;
+  const transport = async (url, opts) => {
+    if (url === 'https://xyc.ai/sign-in') return { status: 200, headers: {}, text: () => '', json: () => null };
+    if (url === 'https://xyc.ai/api/oauth/state?aff=') return { status: 200, headers: {}, text: () => '{"data":"STATE123"}', json: () => ({ data: 'STATE123' }) };
+    if (url.startsWith('https://github.com/login/oauth/authorize?')) return { status: 302, headers: { location: 'https://xyc.ai/oauth/github?code=C&state=STATE123' }, text: () => '', json: () => null };
+    if (url === 'https://xyc.ai/api/oauth/github?code=C&state=STATE123') return { status: 200, headers: {}, text: () => '{"success":true,"data":{"id":641}}', json: () => ({ success: true, data: { id: 641 } }) };
+    if (url === 'https://xyc.ai/api/token/') {
+      capturedPayload = JSON.parse(opts.body);
+      assert.equal(opts.headers['new-api-user'], '641');
+      assert.equal(opts.headers.origin, 'https://xyc.ai');
+      assert.equal(opts.headers.referer, 'https://xyc.ai/keys');
+      return { status: 200, headers: {}, text: () => '{"success":true}', json: () => ({ success: true }) };
+    }
+    if (url === 'https://xyc.ai/api/token/?p=1&size=100') return { status: 200, headers: {}, text: () => '{"data":{"items":[{"id":232,"name":"codex","created_time":1}]}}', json: () => ({ data: { items: [{ id: 232, name: 'codex', created_time: 1 }] } }) };
+    if (url === 'https://xyc.ai/api/token/232/key') return { status: 200, headers: {}, text: () => '{"success":true,"data":{"key":"abc"}}', json: () => ({ success: true, data: { key: 'abc' } }) };
+    throw new Error(`unexpected ${url}`);
+  };
+
+  const result = await runSiteOAuthHttp(
+    { name: 'xyc.ai', baseUrl: 'https://xyc.ai', clientId: 'CLIENT', tokenName: 'codex', tokenGroup: '' },
+    [],
+    { transport }
+  );
+
+  assert.equal(capturedPayload.group, '');
+  assert.equal(capturedPayload.name, 'codex');
+  assert.equal(result.userId, '641');
   assert.equal(result.keys[0].apiKey, 'sk-abc');
 });
 
@@ -301,4 +340,34 @@ test('runSitesOAuthHttp continues with later sites when one site fails', async (
       profile: 'dynamic-fast',
     },
   ]);
+});
+
+test('runSiteOAuthHttp includes state response diagnostics when OAuth state is blocked', async () => {
+  const transport = async (url) => {
+    if (url === 'https://a6api.com/sign-in') {
+      return { status: 200, headers: {}, text: () => '<html>sign in</html>', json: () => null };
+    }
+    if (url === 'https://a6api.com/api/oauth/state?aff=') {
+      return {
+        status: 403,
+        headers: { 'content-type': 'text/html; charset=UTF-8' },
+        text: () => '<html><title>Just a moment...</title><script>challenge()</script><body>Cloudflare verification</body></html>',
+        json: () => null,
+      };
+    }
+    throw new Error(`unexpected ${url}`);
+  };
+
+  await assert.rejects(
+    () => runSiteOAuthHttp({ name: 'a6api', baseUrl: 'https://a6api.com', clientId: 'CLIENT' }, [], { transport }),
+    (err) => {
+      assert.match(err.message, /a6api: unable to fetch OAuth state/);
+      assert.match(err.message, /status=403/);
+      assert.match(err.message, /content-type=text\/html/);
+      assert.match(err.message, /Just a moment/);
+      assert.match(err.message, /Cloudflare verification/);
+      assert.match(err.message, /trace=site_signin:200 \| site_state:403/);
+      return true;
+    }
+  );
 });

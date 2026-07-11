@@ -4,7 +4,7 @@ const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
 const { generateProxyPool } = require('./lib/proxy-pool');
-const { loadDotEnv, normalizeAdminKey } = require('./lib/api-nsnzd-uploader');
+const { loadDotEnv, normalizeAdminKey, resolveUploadGroup } = require('./lib/api-nsnzd-uploader');
 const { reuploadUnuploaded } = require('./register-upload-retry');
 
 function applyDotEnv() {
@@ -66,6 +66,34 @@ function appendFileIfExists(src, dest) {
   fs.mkdirSync(path.dirname(dest), { recursive: true });
   fs.appendFileSync(dest, text.endsWith('\n') ? text : `${text}\n`);
   return true;
+}
+
+function normalizeUploadGroup(group = {}) {
+  if (typeof group === 'number' || typeof group === 'string') {
+    return { id: Number.isFinite(Number(group)) ? Number(group) : group, name: `group-${group}` };
+  }
+  if (!group?.id) throw new Error('upload group selection has no id');
+  return {
+    id: Number.isFinite(Number(group.id)) ? Number(group.id) : group.id,
+    name: group.name || group.group?.name || group.group?.group_name || `group-${group.id}`,
+  };
+}
+
+async function prepareBatchUploadGroupEnv(env = process.env, opts = {}) {
+  const adminKey = normalizeAdminKey(opts.adminKey || env.API_NSNZD_COM_ADMIN_KEY || '');
+  if (!adminKey) throw new Error('API_NSNZD_COM_ADMIN_KEY is required');
+  const resolver = opts.resolveUploadGroupFn || resolveUploadGroup;
+  const selected = normalizeUploadGroup(await resolver({
+    adminKey,
+    env,
+    promptGroup: opts.promptGroup,
+    promptFn: opts.promptFn,
+    cache: opts.groupCache,
+  }));
+  env.UPLOAD_GROUP_ID = String(selected.id);
+  env.UPLOAD_GROUP_NAME = selected.name;
+  env.UPLOAD_GROUP_PROMPT = 'false';
+  return selected;
 }
 
 function runRegisterUploadChild({ proxy, slot, index, resultDir, env = process.env, spawnImpl = spawn }) {
@@ -148,8 +176,10 @@ async function main() {
   applyDotEnv();
   const adminKey = normalizeAdminKey(process.env.API_NSNZD_COM_ADMIN_KEY || '');
   if (!adminKey) throw new Error('API_NSNZD_COM_ADMIN_KEY is required');
+  const uploadGroup = await prepareBatchUploadGroupEnv(process.env, { adminKey });
   const config = buildBatchConfig(process.env);
   console.log(`[batch] total=${config.total} concurrency=${config.concurrency} proxies=${config.proxies.length}`);
+  console.log(`[batch] upload group=${uploadGroup.name} (#${uploadGroup.id})`);
   const res = await runBatch(config);
   if (config.autoRetryUpload) {
     const resultsFile = path.join(config.resultDir, 'results.jsonl');
@@ -176,6 +206,7 @@ module.exports = {
   buildBatchConfig,
   buildChildEnv,
   appendFileIfExists,
+  prepareBatchUploadGroupEnv,
   runBatch,
   runRegisterUploadChild,
   maskProxy,

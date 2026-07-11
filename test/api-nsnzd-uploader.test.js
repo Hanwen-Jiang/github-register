@@ -9,9 +9,14 @@ const {
   formatUtcTimestamp,
   normalizeAdminKey,
   normalizeResultKeys,
+  resolveApiNsnzdProxy,
+  resolveDefaultGroupId,
+  resolveUploadGroup,
   resolveModelProxy,
   retryAsync,
   siteSlug,
+  uploadAccounts,
+  apiNsnzdGet,
 } = require('../lib/api-nsnzd-uploader');
 
 test('normalizeAdminKey trims whitespace and surrounding quotes', () => {
@@ -204,4 +209,177 @@ test('resolveModelProxy only uses explicit upload/model proxy settings', () => {
     }),
     'socks5://explicit-legacy-proxy:10000'
   );
+});
+
+test('resolveApiNsnzdProxy uses explicit API proxy before generic proxy', () => {
+  assert.equal(
+    resolveApiNsnzdProxy({}, { API_NSNZD_PROXY: 'socks5://127.0.0.1:2080', PROXY: 'socks5://other:10000' }),
+    'socks5://127.0.0.1:2080'
+  );
+  assert.equal(
+    resolveApiNsnzdProxy({}, { API_NSNZD_PROXY_MODE: 'registration-proxy', PROXY: 'socks5://127.0.0.1:2080' }),
+    'socks5://127.0.0.1:2080'
+  );
+  assert.equal(resolveApiNsnzdProxy({}, { PROXY: 'socks5://127.0.0.1:2080' }), '');
+});
+
+test('uploadAccounts sends api.nsnzd.com batch upload through explicit proxy transport', async () => {
+  const calls = [];
+  const resp = await uploadAccounts([{ name: 'acct' }], {
+    adminKey: 'admin-test',
+    apiProxy: 'socks5://127.0.0.1:2080',
+    deps: {
+      initSocks: (proxy) => calls.push(['init', proxy]),
+      socksRequest: async (url, opts) => {
+        calls.push(['socks', url, opts.method, opts.headers['x-api-key'], opts.body]);
+        return { status: 200, text: () => '{"code":0,"data":{"success":true}}' };
+      },
+      fetchImpl: async () => { throw new Error('fetch should not be used'); },
+    },
+  });
+
+  assert.deepEqual(resp, { success: true });
+  assert.equal(calls[0][0], 'init');
+  assert.equal(calls[0][1], 'socks5://127.0.0.1:2080');
+  assert.equal(calls[1][0], 'socks');
+  assert.equal(calls[1][1], 'https://api.nsnzd.com/api/v1/admin/accounts/batch');
+  assert.equal(calls[1][2], 'POST');
+  assert.equal(calls[1][3], 'admin-test');
+  assert.match(calls[1][4], /"accounts"/);
+});
+
+test('apiNsnzdGet sends admin GET through explicit proxy transport', async () => {
+  const calls = [];
+  const groups = await apiNsnzdGet('/api/v1/admin/groups/all?include_inactive=true', {
+    adminKey: 'admin-test',
+    apiProxy: 'socks5://127.0.0.1:2080',
+    deps: {
+      initSocks: (proxy) => calls.push(['init', proxy]),
+      socksRequest: async (url, opts) => {
+        calls.push(['socks', url, opts.method || 'GET', opts.headers['x-api-key']]);
+        return { status: 200, text: () => '{"code":0,"data":[{"id":1,"name":"default"}]}' };
+      },
+      fetchImpl: async () => { throw new Error('fetch should not be used'); },
+    },
+  });
+
+  assert.deepEqual(groups, [{ id: 1, name: 'default' }]);
+  assert.deepEqual(calls, [
+    ['init', 'socks5://127.0.0.1:2080'],
+    ['socks', 'https://api.nsnzd.com/api/v1/admin/groups/all?include_inactive=true', 'GET', 'admin-test'],
+  ]);
+});
+
+test('apiNsnzdGet tolerates chunk terminator left by SOCKS transport', async () => {
+  const groups = await apiNsnzdGet('/api/v1/admin/groups/all?include_inactive=true', {
+    adminKey: 'admin-test',
+    requestImpl: async () => ({
+      ok: true,
+      status: 200,
+      text: async () => '{"code":0,"message":"success","data":[{"id":2,"name":"OpenAI 官方渠道","status":"active"}]}\r\n0\r\n\r\n',
+    }),
+  });
+
+  assert.deepEqual(groups, [{ id: 2, name: 'OpenAI 官方渠道', status: 'active' }]);
+});
+
+test('resolveDefaultGroupId can use an explicit env group id', async () => {
+  const id = await resolveDefaultGroupId({
+    adminKey: 'admin-test',
+    env: { UPLOAD_GROUP_ID: '2' },
+    requestImpl: async () => { throw new Error('groups endpoint should not be called'); },
+  });
+
+  assert.equal(id, 2);
+});
+
+test('resolveDefaultGroupId falls back to the first active group when default is absent', async () => {
+  const id = await resolveDefaultGroupId({
+    adminKey: 'admin-test',
+    requestImpl: async () => ({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ code: 0, data: [
+        { id: 2, name: 'OpenAI 官方渠道', status: 'inactive' },
+        { id: 3, name: 'Claude 渠道', status: 'active' },
+      ] }),
+    }),
+  });
+
+  assert.equal(id, 3);
+});
+
+test('resolveUploadGroup fetches groups and asks which group to upload into', async () => {
+  const calls = [];
+  const promptCalls = [];
+
+  const group = await resolveUploadGroup({
+    adminKey: 'admin-test',
+    cache: false,
+    env: {},
+    requestImpl: async (url) => {
+      calls.push(url);
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({ code: 0, data: [
+          { id: 1, name: 'default', status: 'active' },
+          { id: 9, name: 'Claude 渠道', status: 'active' },
+        ] }),
+      };
+    },
+    promptFn: async (ctx) => {
+      promptCalls.push(ctx);
+      return '9';
+    },
+  });
+
+  assert.deepEqual(group, {
+    id: 9,
+    name: 'Claude 渠道',
+    group: { id: 9, name: 'Claude 渠道', status: 'active' },
+  });
+  assert.deepEqual(calls, ['https://api.nsnzd.com/api/v1/admin/groups/all?include_inactive=true']);
+  assert.equal(promptCalls.length, 1);
+  assert.equal(promptCalls[0].defaultGroup.id, 1);
+  assert.deepEqual(promptCalls[0].groups.map(g => g.id), [1, 9]);
+});
+
+test('apiNsnzdGet parses nested JSON strings returned by proxy transport', async () => {
+  const groups = await apiNsnzdGet('/api/v1/admin/groups/all?include_inactive=true', {
+    adminKey: 'admin-test',
+    requestImpl: async () => ({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify('{"code":0,"message":"success","data":[{"id":4,"name":"default","status":"active"}]}'),
+    }),
+  });
+
+  assert.deepEqual(groups, [{ id: 4, name: 'default', status: 'active' }]);
+});
+
+test('apiNsnzdGet parses nested JSON strings with chunk terminator returned by proxy transport', async () => {
+  const groups = await apiNsnzdGet('/api/v1/admin/groups/all?include_inactive=true', {
+    adminKey: 'admin-test',
+    requestImpl: async () => ({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify('{"code":0,"message":"success","data":[{"id":5,"name":"default","status":"active"}]}\r\n0\r\n\r\n'),
+    }),
+  });
+
+  assert.deepEqual(groups, [{ id: 5, name: 'default', status: 'active' }]);
+});
+
+test('apiNsnzdGet tolerates partial chunk terminator left by SOCKS transport', async () => {
+  const proxies = await apiNsnzdGet('/api/v1/admin/proxies/all?include_inactive=true', {
+    adminKey: 'admin-test',
+    requestImpl: async () => ({
+      ok: true,
+      status: 200,
+      text: async () => '{"code":0,"message":"success","data":[{"id":2,"name":"default","status":"active"}]}\r\n0\r',
+    }),
+  });
+
+  assert.deepEqual(proxies, [{ id: 2, name: 'default', status: 'active' }]);
 });

@@ -1,8 +1,10 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const path = require('node:path');
 const {
   buildBatchConfig,
   buildChildEnv,
+  prepareBatchUploadGroupEnv,
   runBatch,
 } = require('../batch-register-upload');
 
@@ -51,8 +53,26 @@ test('buildChildEnv gives every job an isolated result file and shared merged re
   });
 
   assert.equal(env.PROXY, 'p1');
-  assert.equal(env.RESULT_LOCAL_FILE, '/tmp/batch-results/runs/slot02-job0009.jsonl');
-  assert.equal(env.BATCH_SHARED_RESULT_FILE, '/tmp/batch-results/results.jsonl');
-  assert.equal(env.UPLOAD_LEDGER_FILE, '/tmp/batch-results/uploaded.jsonl');
-  assert.equal(env.CHROME_PROFILE_DIR, '/tmp/batch-results/chrome/slot02-job0009');
+  assert.equal(env.RESULT_LOCAL_FILE, path.join('/tmp/batch-results', 'runs', 'slot02-job0009.jsonl'));
+  assert.equal(env.BATCH_SHARED_RESULT_FILE, path.join('/tmp/batch-results', 'results.jsonl'));
+  assert.equal(env.UPLOAD_LEDGER_FILE, path.join('/tmp/batch-results', 'uploaded.jsonl'));
+  assert.equal(env.CHROME_PROFILE_DIR, path.join('/tmp/batch-results', 'chrome', 'slot02-job0009'));
+});
+
+test('prepareBatchUploadGroupEnv selects Sub2API group before batch children start', async () => {
+  const env = { API_NSNZD_COM_ADMIN_KEY: 'admin-test' };
+  const order = [];
+
+  const selected = await prepareBatchUploadGroupEnv(env, {
+    resolveUploadGroupFn: async ({ adminKey }) => {
+      order.push(`group:${adminKey}`);
+      return { id: 9, name: 'Claude 渠道' };
+    },
+  });
+
+  assert.deepEqual(order, ['group:admin-test']);
+  assert.deepEqual(selected, { id: 9, name: 'Claude 渠道' });
+  assert.equal(env.UPLOAD_GROUP_ID, '9');
+  assert.equal(env.UPLOAD_GROUP_NAME, 'Claude 渠道');
+  assert.equal(env.UPLOAD_GROUP_PROMPT, 'false');
 });

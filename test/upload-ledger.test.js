@@ -47,3 +47,36 @@ test('findUnuploaded returns only results absent from ledger', () => {
   const missing = findUnuploaded(results, f);
   assert.deepEqual(missing.map(r => r.source), ['r2', 'r3']);
 });
+
+test('resultId does not collapse multiple stage-b-oauth rows into one source id', () => {
+  const r1 = {
+    source: 'stage-b-oauth',
+    email: 'a@nsnzd.com',
+    username: 'u1',
+    uploaded_at: 't1',
+    keys: [{ site: 'cun.ai', userId: '100', profile: 'dynamic-cheap', apiKey: 'sk-aaaaaaaaaa1111111111' }],
+  };
+  const r2 = {
+    source: 'stage-b-oauth',
+    email: 'a@nsnzd.com',
+    username: 'u1',
+    uploaded_at: 't2',
+    keys: [{ site: 'a6api', userId: '200', profile: 'dynamic-cheap', apiKey: 'sk-bbbbbbbbbb2222222222' }],
+  };
+
+  assert.notEqual(resultId(r1), 'stage-b-oauth');
+  assert.notEqual(resultId(r2), 'stage-b-oauth');
+  assert.notEqual(resultId(r1), resultId(r2));
+});
+
+test('findUnuploaded reports later stage-b-oauth rows even when an old generic source id exists', () => {
+  const f = tmpLedger();
+  fs.appendFileSync(f, `${JSON.stringify({ id: 'stage-b-oauth' })}\n`);
+  const rows = [
+    { source: 'stage-b-oauth', username: 'u1', uploaded_at: 't1', keys: [{ site: 'cun.ai', userId: '1', profile: 'dynamic-cheap', apiKey: 'sk-1111111111' }] },
+    { source: 'stage-b-oauth', username: 'u1', uploaded_at: 't2', keys: [{ site: 'a6api', userId: '2', profile: 'dynamic-cheap', apiKey: 'sk-2222222222' }] },
+  ];
+
+  assert.deepEqual(findUnuploaded(rows, f).map(resultId), rows.map(resultId));
+});
+

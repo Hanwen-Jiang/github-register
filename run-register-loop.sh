@@ -11,6 +11,7 @@
 # 用法:
 #   ./run-register-loop.sh                       # 串行，110-600s 随机间隔，无限循环，有头
 #   ./run-register-loop.sh --headless            # 同上，无头
+#   ./run-register-loop.sh -Headless             # 同上，无头（兼容 PowerShell 参数习惯）
 #   ./run-register-loop.sh --concurrency 3 --headless
 #   ./run-register-loop.sh --concurrency 5 --max-runs 50 --min-seconds 30 --max-seconds 90
 #
@@ -22,7 +23,7 @@
 #   --project-dir DIR     package.json 所在目录（默认脚本所在目录）
 #   --log-file FILE       主日志追加文件（默认 <project-dir>/logs/register-loop.log）
 #   --first-delay N       首次投放前等待秒数（默认 0）
-#   --headless            设 HEADLESS=true 无头运行；不传维持项目默认（有头）
+#   --headless|-Headless  设 HEADLESS=true 无头运行；不传维持项目默认（有头）
 
 set -u
 
@@ -44,7 +45,7 @@ while [[ $# -gt 0 ]]; do
         --project-dir) PROJECT_DIR="$2"; shift 2 ;;
         --log-file) LOG_FILE="$2"; shift 2 ;;
         --first-delay) FIRST_DELAY="$2"; shift 2 ;;
-        --headless) HEADLESS=1; shift ;;
+        --headless|-Headless|-headless) HEADLESS=1; shift ;;
         -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
         *) echo "未知参数: $1" >&2; exit 1 ;;
     esac

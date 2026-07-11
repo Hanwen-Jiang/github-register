@@ -19,6 +19,7 @@ const {
   normalizeAdminKey,
   apiNsnzdGet,
   resolveDefaultGroupId,
+  resolveUploadGroup,
   retryAsync,
   summarizeSecret,
   uploadAccounts,
@@ -71,9 +72,11 @@ function readAdminKey() {
 }
 
 function pickResidentialProxyIds(proxies) {
-  return (Array.isArray(proxies) ? proxies : [])
-    .filter(p => String(p.name || '').toLowerCase() === 'residential proxies')
-    .filter(p => !p.status || String(p.status).toLowerCase() === 'active')
+  const active = (Array.isArray(proxies) ? proxies : [])
+    .filter(p => !p.status || String(p.status).toLowerCase() === 'active');
+  const residential = active.filter(p => String(p.name || '').toLowerCase() === 'residential proxies');
+  const picked = residential.length > 0 ? residential : active;
+  return picked
     .map(p => p.id)
     .filter(id => id !== null && id !== undefined);
 }
@@ -143,12 +146,49 @@ async function verifyAdminKey() {
   }, null, 2));
 }
 
+async function resolveUploadGroupForRun(opts = {}, adminKey) {
+  if (opts.groupId) {
+    const id = Number(opts.groupId);
+    return {
+      id: Number.isFinite(id) ? id : opts.groupId,
+      name: opts.groupName || `group-${opts.groupId}`,
+    };
+  }
+  const envGroupId = process.env.UPLOAD_GROUP_ID || '';
+  const envGroupName = process.env.UPLOAD_GROUP_NAME || '';
+  if (envGroupId && envGroupName) {
+    const id = Number(envGroupId);
+    return {
+      id: Number.isFinite(id) ? id : envGroupId,
+      name: envGroupName,
+    };
+  }
+  const resolver = opts.resolveUploadGroupFn || resolveUploadGroup;
+  const selected = await resolver({
+    adminKey,
+    groupName: opts.groupName,
+    promptGroup: opts.promptGroup,
+    promptFn: opts.promptFn,
+    cache: opts.groupCache,
+  });
+  if (typeof selected === 'number' || typeof selected === 'string') {
+    return { id: Number.isFinite(Number(selected)) ? Number(selected) : selected, name: opts.groupName || `group-${selected}` };
+  }
+  if (!selected?.id) throw new Error('upload group selection has no id');
+  return {
+    id: Number.isFinite(Number(selected.id)) ? Number(selected.id) : selected.id,
+    name: selected.name || selected.group?.name || selected.group?.group_name || opts.groupName || `group-${selected.id}`,
+  };
+}
+
 async function runFullRegisterAndUpload(opts = {}) {
   loadEnv();
   ensureProxyConfigured();
   const adminKey = opts.adminKey || readAdminKey();
 
-  const groupId = opts.groupId || await resolveDefaultGroupId({ adminKey });
+  const uploadGroup = await resolveUploadGroupForRun(opts, adminKey);
+  const groupId = uploadGroup.id;
+  const groupName = uploadGroup.name;
   const proxyIds = await resolveResidentialProxyIds({ adminKey, proxyIds: opts.proxyIds });
   const startedAt = new Date();
   const ledgerFile = opts.ledgerFile || process.env.UPLOAD_LEDGER_FILE || path.join(__dirname, 'data', 'uploaded.jsonl');
@@ -161,6 +201,7 @@ async function runFullRegisterAndUpload(opts = {}) {
       ? await getRegisterAndRunSites()()
       : await runRegisterCliAndLoadLatest({ resultFile: opts.resultFile });
   console.log(`[Upload] 读取本次结果: ${result.username || result.email || 'unknown'} / keys=${Array.isArray(result.keys) ? result.keys.length : 0}`);
+  console.log(`[Upload] 目标分组: ${groupName} (#${groupId})`);
   console.log(`[Upload] 账号代理池 Residential Proxies: ${proxyIds.length > 0 ? proxyIds.join(',') : 'disabled'}`);
 
   const buildAccounts = opts.buildAccountsFn || ((r, o) => buildAnthropicAccountsWithLiveModels(r, o));
@@ -170,7 +211,7 @@ async function runFullRegisterAndUpload(opts = {}) {
     const accounts = await buildAccounts(result, {
       adminKey,
       groupIds: [groupId],
-      groupName: 'default',
+      groupName,
       concurrency: 1,
       priority: 1,
       date: startedAt,

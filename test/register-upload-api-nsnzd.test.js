@@ -66,6 +66,18 @@ test('pickResidentialProxyIds selects active Residential Proxies ids', () => {
   assert.deepEqual(ids, [6, 8]);
 });
 
+
+
+test('pickResidentialProxyIds falls back to all active proxy ids when no Residential Proxies label exists', () => {
+  const ids = pickResidentialProxyIds([
+    { id: 2, name: 'default', status: 'active' },
+    { id: 4, name: 'us', status: 'active' },
+    { id: 5, name: 'old', status: 'inactive' },
+  ]);
+
+  assert.deepEqual(ids, [2, 4]);
+});
+
 test('runRegisterCliAndLoadLatest runs registration as a child process and loads its JSONL result', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'register-upload-cli-'));
   const resultFile = path.join(root, 'results.jsonl');
@@ -114,4 +126,52 @@ test('runFullRegisterAndUpload marks the ledger after a successful upload', asyn
 
   const ids = loadUploadedIds(ledgerFile);
   assert.ok(ids.has('run-led'));
+});
+
+test('runFullRegisterAndUpload uses the selected Sub2API group for account payloads', async () => {
+  const { runFullRegisterAndUpload } = require('../register-upload-api-nsnzd');
+
+  const oldUploadGroupId = process.env.UPLOAD_GROUP_ID;
+  process.env.UPLOAD_GROUP_ID = '1';
+
+  const result = {
+    username: 'u-group',
+    uploaded_at: 't-group',
+    source: 'run-group',
+    keys: [{ site: 'a6api', baseUrl: 'https://a6api.com', apiKey: 'sk-x' }],
+  };
+  let seenBuildOpts = null;
+
+  try {
+    await runFullRegisterAndUpload({
+      adminKey: 'admin-test',
+      proxyIds: [6],
+      ledgerFile: path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'reg-group-ledger-')), 'uploaded.jsonl'),
+      registerAndRunSites: async () => result,
+      resolveUploadGroupFn: async () => ({ id: 9, name: 'Claude 渠道' }),
+      buildAccountsFn: async (r, opts) => {
+        seenBuildOpts = opts;
+        return [{
+          name: 'n',
+          platform: 'anthropic',
+          type: 'apikey',
+          credentials: {
+            base_url: 'https://a6api.com',
+            api_key: r.keys[0].apiKey,
+            model_mapping: { 'claude-opus-4-8': 'claude-opus-4-8' },
+          },
+          concurrency: opts.concurrency,
+          priority: opts.priority,
+          group_ids: opts.groupIds,
+        }];
+      },
+      uploadFn: async () => ({ success: 1, failed: 0 }),
+    });
+  } finally {
+    if (oldUploadGroupId === undefined) delete process.env.UPLOAD_GROUP_ID;
+    else process.env.UPLOAD_GROUP_ID = oldUploadGroupId;
+  }
+
+  assert.deepEqual(seenBuildOpts.groupIds, [9]);
+  assert.equal(seenBuildOpts.groupName, 'Claude 渠道');
 });
