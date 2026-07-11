@@ -2,8 +2,19 @@
 'use strict';
 
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const { main: runOauthSite } = require('./oauth-site');
 const { loadDotEnv, normalizeAdminKey, resolveUploadGroup } = require('./lib/api-nsnzd-uploader');
+const sitesLibDefault = require('./lib/sites');
+const storeDefault = require('./lib/session-store');
+const { probeSiteGroupsHttp } = require('./lib/hybrid-oauth');
+const {
+  fallbackGroupOptions,
+  promptSiteGroupSelection,
+  readGroupConfig,
+  writeGroupConfig,
+} = require('./lib/site-groups');
 
 function applyDotEnv(env = process.env) {
   const values = loadDotEnv();
@@ -42,6 +53,15 @@ function buildBatchConfig(env = process.env) {
   );
   const consecutiveFailLimit = failLimit(env.OAUTH_SITE_BATCH_FAIL_LIMIT || env.OAUTH_SITE_FAIL_LIMIT, 3);
   return { total, delayMinMs, delayMaxMs, failLimit: consecutiveFailLimit };
+}
+
+function parseBatchArgs(argv = process.argv.slice(2)) {
+  const out = { reuseGroupConfig: false, groupConfigFile: '' };
+  for (let i = 0; i < argv.length; i += 1) {
+    if (argv[i] === '--reuse-group-config') out.reuseGroupConfig = true;
+    else if (argv[i] === '--group-config') out.groupConfigFile = argv[++i] || '';
+  }
+  return out;
 }
 
 function randomFloat() {
@@ -86,6 +106,93 @@ async function prepareBatchUploadGroupEnv(env = process.env, opts = {}) {
   env.UPLOAD_GROUP_NAME = selected.name;
   env.UPLOAD_GROUP_PROMPT = 'false';
   return selected;
+}
+
+function defaultGroupConfigFile(rootDir, env = process.env) {
+  return path.resolve(env.OAUTH_SITE_GROUP_CONFIG_FILE || path.join(rootDir, 'data', 'oauth-site-batch-groups.json'));
+}
+
+function resolveBatchSessionFile(rootDir, env = process.env, opts = {}) {
+  if (opts.sessionFile) return path.resolve(opts.sessionFile);
+  if (env.SESSION_STORE_FILE || env.SESSIONS_FILE) return path.resolve(env.SESSION_STORE_FILE || env.SESSIONS_FILE);
+  const candidates = [
+    path.join(rootDir, 'data', 'sessions.rescreened.usable.jsonl'),
+    path.join(rootDir, 'data', 'sessions.win_gw_lou.usable.jsonl'),
+  ];
+  return candidates.find(file => fs.existsSync(file)) || path.join(rootDir, 'data', 'sessions.jsonl');
+}
+
+function applyBatchGroupConfigEnv(env, config, file) {
+  if (config.uploadGroup) {
+    env.UPLOAD_GROUP_ID = String(config.uploadGroup.id);
+    env.UPLOAD_GROUP_NAME = String(config.uploadGroup.name || `group-${config.uploadGroup.id}`);
+    env.UPLOAD_GROUP_PROMPT = 'false';
+  }
+  env.OAUTH_SITE_GROUP_CONFIG_FILE = file;
+  return env;
+}
+
+async function prepareBatchGroupConfig(env = process.env, args = parseBatchArgs(), opts = {}) {
+  const rootDir = opts.rootDir || __dirname;
+  const sitesLib = opts.sitesLib || sitesLibDefault;
+  const store = opts.store || storeDefault;
+  const targetSites = opts.targetSites || sitesLib.resolveTargetSites();
+  if (!targetSites.length) throw new Error('no target sites configured for oauth batch');
+  const file = path.resolve(args.groupConfigFile || defaultGroupConfigFile(rootDir, env));
+  const readConfig = opts.readGroupConfigFn || readGroupConfig;
+  if (args.reuseGroupConfig) {
+    const config = readConfig(file, targetSites);
+    applyBatchGroupConfigEnv(env, config, file);
+    const sessionFile = resolveBatchSessionFile(rootDir, env, opts);
+    env.SESSION_STORE_FILE = sessionFile;
+    return { config, file, sessionFile, targetSites, reused: true };
+  }
+
+  const uploadGroup = await prepareBatchUploadGroupEnv(env, opts);
+  const sessionFile = resolveBatchSessionFile(rootDir, env, opts);
+  env.SESSION_STORE_FILE = sessionFile;
+  const routingProfiles = opts.routingProfiles || sitesLib.resolveRoutingProfiles();
+  const findSession = opts.findSessionFn || (async site => store.findAvailableSession(site.name, { rootDir, file: sessionFile }));
+  const getCookies = opts.getSessionCookiesFn || store.getSessionCookies;
+  const probeGroups = opts.probeSiteGroupsFn || probeSiteGroupsHttp;
+  const promptGroups = opts.promptSiteGroupSelectionFn || promptSiteGroupSelection;
+  const siteSelections = {};
+
+  for (const site of targetSites) {
+    let options;
+    let discoveryError = '';
+    try {
+      const session = await findSession(site);
+      if (!session) throw new Error(`no usable session for ${site.name}`);
+      const probe = await probeGroups(site, getCookies(session), {
+        proxyUrl: require('./oauth-site').resolveSessionProxyUrl(session, env),
+      });
+      options = probe.options || probe;
+      if (!Array.isArray(options) || !options.length) throw new Error(`${site.name}: group probe returned no options`);
+    } catch (err) {
+      discoveryError = String(err.message || err);
+      options = fallbackGroupOptions(site, routingProfiles);
+      if (opts.log !== false) console.log(`[oauth-site-batch] ${site.name} group discovery fallback: ${discoveryError}`);
+    }
+    const selected = await promptGroups(site, options, { promptFn: opts.sitePromptFn });
+    siteSelections[site.name] = {
+      source: options.every(option => option.source === options[0].source) ? options[0].source : 'mixed',
+      selected,
+      ...(discoveryError ? { discoveryError } : {}),
+    };
+  }
+
+  const config = {
+    version: 1,
+    savedAt: new Date().toISOString(),
+    uploadEnabled: Boolean(uploadGroup),
+    uploadGroup: uploadGroup || null,
+    sites: siteSelections,
+  };
+  const writeConfig = opts.writeGroupConfigFn || writeGroupConfig;
+  writeConfig(file, config);
+  applyBatchGroupConfigEnv(env, config, file);
+  return { config, file, sessionFile, targetSites, reused: false };
 }
 
 async function runBatch(opts = {}) {
@@ -137,13 +244,21 @@ async function runBatch(opts = {}) {
   return stopped ? { total, ok, failed, attempted, stopped } : { total, ok, failed, attempted };
 }
 
-async function main() {
-  applyDotEnv();
-  const uploadGroup = await prepareBatchUploadGroupEnv(process.env);
-  if (uploadGroup) console.log(`[oauth-site-batch] upload group=${uploadGroup.name} (#${uploadGroup.id})`);
-  const cfg = buildBatchConfig(process.env);
-  const res = await runBatch(cfg);
-  console.log(`[oauth-site-batch] done target_ok=${res.total} ok=${res.ok} failed=${res.failed} attempted=${res.attempted}${res.stopped ? ' stopped=true' : ''}`);
+async function main(opts = {}) {
+  const env = opts.env || process.env;
+  if (opts.loadEnv !== false) applyDotEnv(env);
+  const args = opts.args || parseBatchArgs(opts.argv || process.argv.slice(2));
+  const prepare = opts.prepareBatchGroupConfigFn || prepareBatchGroupConfig;
+  const prepared = await prepare(env, args, opts);
+  if (opts.log !== false) {
+    const uploadGroup = prepared.config.uploadGroup;
+    if (uploadGroup) console.log(`[oauth-site-batch] upload group=${uploadGroup.name} (#${uploadGroup.id})`);
+    console.log(`[oauth-site-batch] group config=${prepared.file}${prepared.reused ? ' (reused)' : ''}`);
+  }
+  const cfg = { ...buildBatchConfig(env), ...(opts.runOne ? { runOne: opts.runOne } : {}) };
+  const run = opts.runBatchFn || runBatch;
+  const res = await run(cfg);
+  if (opts.log !== false) console.log(`[oauth-site-batch] done target_ok=${res.total} ok=${res.ok} failed=${res.failed} attempted=${res.attempted}${res.stopped ? ' stopped=true' : ''}`);
   if (res.stopped || res.ok < res.total) process.exitCode = 1;
   return res;
 }
@@ -157,8 +272,13 @@ if (require.main === module) {
 
 module.exports = {
   buildBatchConfig,
+  parseBatchArgs,
   delayMs,
   pickDelayMs,
+  defaultGroupConfigFile,
+  resolveBatchSessionFile,
+  applyBatchGroupConfigEnv,
+  prepareBatchGroupConfig,
   prepareBatchUploadGroupEnv,
   runBatch,
   main,

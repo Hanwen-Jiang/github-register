@@ -20,12 +20,13 @@ function parsePositive(value, fallback) {
 }
 
 function parseArgs(argv = process.argv.slice(2)) {
-  const out = { refreshExpired: true, outputDir: '', limit: Infinity, searchDelayMs: 100 };
+  const out = { refreshExpired: true, outputDir: '', limit: Infinity, searchDelayMs: 100, searchBatchSize: 2 };
   for (let i = 0; i < argv.length; i += 1) {
     if (argv[i] === '--no-refresh') out.refreshExpired = false;
     else if (argv[i] === '--output-dir') out.outputDir = argv[++i] || '';
     else if (argv[i] === '--limit') out.limit = parsePositive(argv[++i], Infinity) || Infinity;
     else if (argv[i] === '--search-delay-ms') out.searchDelayMs = parsePositive(argv[++i], 100);
+    else if (argv[i] === '--search-batch-size') out.searchBatchSize = parsePositive(argv[++i], 2) || 2;
   }
   return out;
 }
@@ -41,34 +42,88 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-async function requestGithubUserSearch(client, username) {
+async function requestGithubUserSearch(client, username, opts = {}) {
   const url = `https://github.com/search?q=${encodeURIComponent(username)}&type=users`;
-  const response = await client.get(url, {
-    accept: 'application/json',
-    'accept-language': 'en,zh-CN;q=0.9,zh;q=0.8',
-    referer: url,
-    'x-github-app-type': 'navigator',
-    'x-github-target': 'dotcom',
-    'x-react-router': 'json',
-    'x-requested-with': 'XMLHttpRequest',
-  });
-  const json = response.json();
-  if (response.status !== 200 || !Array.isArray(json?.payload?.results)) {
-    throw new Error(`github search unavailable status=${response.status}`);
+  const retries = opts.retries ?? 6;
+  const doSleep = opts.sleep || sleep;
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    const response = await client.get(url, {
+      accept: 'application/json',
+      'accept-language': 'en,zh-CN;q=0.9,zh;q=0.8',
+      referer: url,
+      'x-github-app-type': 'navigator',
+      'x-github-target': 'dotcom',
+      'x-react-router': 'json',
+      'x-requested-with': 'XMLHttpRequest',
+    });
+    const json = response.json();
+    if (response.status === 200 && Array.isArray(json?.payload?.results)) return json;
+    if (response.status !== 429 || attempt >= retries) {
+      throw new Error(`github search unavailable status=${response.status}`);
+    }
+    const retryAfter = Number(headerValue(response.headers, 'retry-after'));
+    const backoffMs = Number.isFinite(retryAfter) && retryAfter > 0
+      ? retryAfter * 1000
+      : Math.min(120000, 15000 * (2 ** attempt));
+    if (typeof opts.onRetry === 'function') {
+      opts.onRetry({ username, attempt: attempt + 1, waitMs: backoffMs, status: response.status });
+    }
+    await doSleep(backoffMs);
   }
-  return json;
+  throw new Error('github search retry loop exhausted');
+}
+
+async function searchGithubUsersInBatches(usernames, opts = {}) {
+  if (typeof opts.requestSearch !== 'function') throw new Error('requestSearch is required');
+  const batchSize = Math.max(1, Number(opts.batchSize || 10));
+  const delayMs = Math.max(0, Number(opts.delayMs || 0));
+  const doSleep = opts.sleep || sleep;
+  const unique = [...new Set((usernames || []).map(name => String(name || '').trim()).filter(Boolean))];
+  const alive = new Set();
+  const totalBatches = Math.ceil(unique.length / batchSize);
+  for (let offset = 0, batch = 0; offset < unique.length; offset += batchSize, batch += 1) {
+    if (batch > 0 && delayMs > 0) await doSleep(delayMs);
+    const names = unique.slice(offset, offset + batchSize);
+    const json = await opts.requestSearch(names.join(' OR '), names);
+    const expected = new Set(names.map(name => name.toLowerCase()));
+    for (const result of json?.payload?.results || []) {
+      const login = String(result?.login || '').trim();
+      if (expected.has(login.toLowerCase())) alive.add(login.toLowerCase());
+    }
+    if (typeof opts.onBatch === 'function') {
+      opts.onBatch({ batch: batch + 1, totalBatches, checked: Math.min(offset + names.length, unique.length), total: unique.length });
+    }
+  }
+  return alive;
 }
 
 async function findSearchClient(records, opts = {}) {
   const probeUsername = opts.probeUsername || process.env.GITHUB_SEARCH_PROBE_USERNAME || 'nsnzd-laylazhao674305';
-  for (const session of records) {
+  const priority = session => {
+    const source = String(session.source_file || '');
+    if (/sessions\.rescreened\.usable\.jsonl$/i.test(source)) return 0;
+    if (/sessions\.win_gw_lou\.usable\.jsonl$/i.test(source)) return 1;
+    if (/[/\\]sessions\.jsonl$/i.test(source)) return 2;
+    return 3;
+  };
+  const candidates = records.slice().sort((a, b) => priority(a) - priority(b));
+  const createClient = opts.clientFactory || (session => {
+    const client = new HttpClient({ proxyUrl: resolveSessionProxyUrl(session) });
+    client.importPlaywrightCookies(store.getSessionCookies(session));
+    return client;
+  });
+  const requestSearch = opts.requestSearch || (client => requestGithubUserSearch(client, probeUsername, { retries: 0 }));
+  for (let index = 0; index < candidates.length; index += 1) {
+    const session = candidates[index];
     if (!store.getSessionCookies(session).length) continue;
     try {
-      const client = new HttpClient({ proxyUrl: resolveSessionProxyUrl(session) });
-      client.importPlaywrightCookies(store.getSessionCookies(session));
-      const json = await requestGithubUserSearch(client, probeUsername);
+      const client = createClient(session);
+      const json = await requestSearch(client, probeUsername, session);
       if (parseGithubUserSearch(json, probeUsername)) return client;
-    } catch (_) {}
+    } catch (err) {
+      if (/status=429\b/.test(String(err.message || err))) throw err;
+    }
+    if (typeof opts.onCandidate === 'function') opts.onCandidate({ checked: index + 1, total: candidates.length });
   }
   throw new Error('no search-capable GitHub session found');
 }
@@ -93,14 +148,27 @@ async function main(opts = {}) {
   console.log(`[session-rescreen] files=${files.length} rows=${records.length} identities=${identities.length}`);
 
   const searchClient = opts.searchClient || await findSearchClient(records, opts);
-  let lastSearchAt = 0;
-  const searchUser = opts.searchUser || (async username => {
-    const wait = Math.max(0, args.searchDelayMs - (Date.now() - lastSearchAt));
-    if (wait) await sleep(wait);
-    const json = await requestGithubUserSearch(searchClient, username);
-    lastSearchAt = Date.now();
-    return json;
-  });
+  console.log('[session-rescreen] GitHub search session ready');
+  let searchUser = opts.searchUser;
+  if (!searchUser) {
+    const alive = await searchGithubUsersInBatches(identities.map(identity => identity.username), {
+      batchSize: opts.searchBatchSize || args.searchBatchSize,
+      delayMs: args.searchDelayMs,
+      requestSearch: query => requestGithubUserSearch(searchClient, query, {
+        onRetry: ({ attempt, waitMs }) => {
+          console.log(`[session-rescreen] GitHub search rate limited; retry=${attempt} wait=${Math.ceil(waitMs / 1000)}s`);
+        },
+      }),
+      onBatch: progress => {
+        if (progress.batch === progress.totalBatches || progress.batch % 10 === 0) {
+          console.log(`[session-rescreen] account search batches=${progress.batch}/${progress.totalBatches} usernames=${progress.checked}/${progress.total}`);
+        }
+      },
+    });
+    searchUser = async username => ({
+      payload: { results: alive.has(String(username).toLowerCase()) ? [{ login: username }] : [] },
+    });
+  }
   const refreshSession = args.refreshExpired
     ? (opts.refreshSession || (async session => {
         const refresh = require('./refresh-github-sessions');
@@ -138,6 +206,7 @@ if (require.main === module) {
 module.exports = {
   parseArgs,
   requestGithubUserSearch,
+  searchGithubUsersInBatches,
   findSearchClient,
   verifyGithubSession,
   main,

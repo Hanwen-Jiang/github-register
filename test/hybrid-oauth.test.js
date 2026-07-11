@@ -371,3 +371,141 @@ test('runSiteOAuthHttp includes state response diagnostics when OAuth state is b
     }
   );
 });
+
+test('fetchSiteGroupOptionsHttp reads and normalizes authenticated site groups', async () => {
+  const { fetchSiteGroupOptionsHttp } = require('../lib/hybrid-oauth');
+  const calls = [];
+  const auth = {
+    site: { name: 'a6api' },
+    baseUrl: 'https://a6api.com',
+    apiHeaders: { 'new-api-user': '42' },
+    client: {
+      async get(url, headers) {
+        calls.push({ url, headers });
+        return {
+          status: 200,
+          text: () => '{"success":true}',
+          json: () => ({ success: true, data: { default: { desc: '默认分组', ratio: 1 } } }),
+        };
+      },
+    },
+  };
+
+  const options = await fetchSiteGroupOptionsHttp(auth);
+
+  assert.deepEqual(options, [{ value: 'default', label: '默认分组', description: '默认分组', ratio: 1, source: 'live' }]);
+  assert.equal(calls[0].url, 'https://a6api.com/api/user/self/groups');
+  assert.equal(calls[0].headers['new-api-user'], '42');
+});
+
+test('fetchSiteGroupOptionsHttp rejects unsuccessful or empty responses', async () => {
+  const { fetchSiteGroupOptionsHttp } = require('../lib/hybrid-oauth');
+  const auth = {
+    site: { name: 'a6api' },
+    baseUrl: 'https://a6api.com',
+    apiHeaders: { 'new-api-user': '42' },
+    client: {
+      async get() {
+        return { status: 200, text: () => '{"success":true,"data":{}}', json: () => ({ success: true, data: {} }) };
+      },
+    },
+  };
+
+  await assert.rejects(() => fetchSiteGroupOptionsHttp(auth), /group list is empty/i);
+});
+
+test('mintSiteKeysHttp creates exactly one key per live group selection', async () => {
+  const { mintSiteKeysHttp } = require('../lib/hybrid-oauth');
+  const payloads = [];
+  let nextId = 10;
+  const items = [];
+  const auth = {
+    site: { name: 'a6api', tokenName: 'claude', tokenGroup: 'default' },
+    baseUrl: 'https://a6api.com',
+    userId: '42',
+    apiHeaders: { 'new-api-user': '42' },
+    trace: [],
+    client: {
+      async postJson(url, body) {
+        if (url === 'https://a6api.com/api/token/') {
+          const payload = body;
+          const id = nextId++;
+          payloads.push(payload);
+          items.push({ id, name: payload.name });
+          return { status: 200, text: () => '{"success":true}', json: () => ({ success: true }) };
+        }
+        const match = url.match(/\/api\/token\/(\d+)\/key$/);
+        if (match) return { status: 200, text: () => '{"success":true}', json: () => ({ success: true, data: { key: `key-${match[1]}` } }) };
+        throw new Error(`unexpected ${url}`);
+      },
+      async get(url) {
+        assert.equal(url, 'https://a6api.com/api/token/?p=1&size=100');
+        return { status: 200, text: () => '', json: () => ({ data: { items } }) };
+      },
+    },
+  };
+
+  const keys = await mintSiteKeysHttp(auth, [
+    { value: 'default', label: 'Default', source: 'live' },
+    { value: 'vip', label: 'VIP', source: 'live' },
+  ]);
+
+  assert.equal(payloads.length, 2);
+  assert.deepEqual(payloads.map(payload => payload.group), ['default', 'vip']);
+  assert.equal(payloads.every(payload => payload.routing_enabled === undefined), true);
+  assert.deepEqual(keys.map(key => ({ group: key.group, source: key.groupSource })), [
+    { group: 'default', source: 'live' },
+    { group: 'vip', source: 'live' },
+  ]);
+});
+
+test('mintSiteKeysHttp applies routing fields only to an a6api fallback selection', async () => {
+  const { mintSiteKeysHttp } = require('../lib/hybrid-oauth');
+  let payload = null;
+  const auth = {
+    site: { name: 'a6api', tokenName: 'claude', tokenGroup: 'default' },
+    baseUrl: 'https://a6api.com',
+    userId: '42',
+    apiHeaders: { 'new-api-user': '42' },
+    trace: [],
+    client: {
+      async postJson(url, body) {
+        if (url.endsWith('/api/token/')) {
+          payload = body;
+          return { status: 200, text: () => '', json: () => ({ success: true }) };
+        }
+        return { status: 200, text: () => '', json: () => ({ success: true, data: { key: 'abc' } }) };
+      },
+      async get() {
+        return { status: 200, text: () => '', json: () => ({ data: { items: [{ id: 7, name: 'dynamic-cheap-claude' }] } }) };
+      },
+    },
+  };
+
+  const keys = await mintSiteKeysHttp(auth, [{
+    value: 'dynamic-cheap',
+    label: 'dynamic-cheap',
+    source: 'fallback-routing',
+    routing: { name: 'dynamic-cheap', routing_enabled: true, routing_preference: 'cheap', pricing_strategy: 'auto' },
+  }]);
+
+  assert.equal(payload.name, 'dynamic-cheap-claude');
+  assert.equal(payload.group, 'default');
+  assert.equal(payload.routing_enabled, true);
+  assert.equal(payload.routing_preference, 'cheap');
+  assert.equal(keys[0].profile, 'dynamic-cheap');
+});
+
+test('resolveSiteSelections ignores legacy global routingProfiles for non-a6api sites', () => {
+  const { resolveSiteSelections } = require('../lib/hybrid-oauth');
+  const profiles = [
+    { name: 'dynamic-cheap', routing_preference: 'cheap' },
+    { name: 'dynamic-fast', routing_preference: 'fast' },
+  ];
+
+  const cun = resolveSiteSelections({ name: 'cun.ai', tokenGroup: 'default' }, { routingProfiles: profiles });
+  const xyc = resolveSiteSelections({ name: 'xyc.ai', tokenGroup: '' }, { routingProfiles: profiles });
+
+  assert.deepEqual(cun, [{ value: 'default', label: 'default', source: 'legacy-default' }]);
+  assert.deepEqual(xyc, [{ value: '', label: '(空分组)', source: 'legacy-default' }]);
+});

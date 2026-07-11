@@ -2,10 +2,17 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
   buildBatchConfig,
+  parseBatchArgs,
   pickDelayMs,
+  prepareBatchGroupConfig,
   prepareBatchUploadGroupEnv,
   runBatch,
+  main,
 } = require('../oauth-site-batch');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { writeGroupConfig } = require('../lib/site-groups');
 
 test('buildBatchConfig defaults to 30-60 second gaps', () => {
   const cfg = buildBatchConfig({ OAUTH_SITE_BATCH_TOTAL: '3' });
@@ -133,4 +140,98 @@ test('prepareBatchUploadGroupEnv selects Sub2API group once before oauth batch s
   assert.equal(env.UPLOAD_GROUP_ID, '9');
   assert.equal(env.UPLOAD_GROUP_NAME, 'Claude 渠道');
   assert.equal(env.UPLOAD_GROUP_PROMPT, 'false');
+});
+
+test('parseBatchArgs supports persisted group config selection and reuse', () => {
+  assert.deepEqual(parseBatchArgs([]), { reuseGroupConfig: false, groupConfigFile: '' });
+  assert.deepEqual(parseBatchArgs(['--reuse-group-config']), { reuseGroupConfig: true, groupConfigFile: '' });
+  assert.deepEqual(parseBatchArgs(['--group-config', '/tmp/groups.json', '--reuse-group-config']), {
+    reuseGroupConfig: true,
+    groupConfigFile: '/tmp/groups.json',
+  });
+});
+
+test('prepareBatchGroupConfig selects upload group first then probes and prompts every site', async () => {
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'oauth-batch-groups-'));
+  const file = path.join(rootDir, 'data', 'chosen.json');
+  const env = { API_NSNZD_COM_ADMIN_KEY: 'admin-test', OAUTH_SITE_IMPORT_API_NSNZD: 'true' };
+  const targetSites = [
+    { name: 'a6api', baseUrl: 'https://a6api.com', tokenGroup: 'default' },
+    { name: 'cun.ai', baseUrl: 'https://www.cun.ai', tokenGroup: 'default' },
+  ];
+  const order = [];
+
+  const prepared = await prepareBatchGroupConfig(env, { reuseGroupConfig: false, groupConfigFile: file }, {
+    rootDir,
+    targetSites,
+    resolveUploadGroupFn: async () => { order.push('upload'); return { id: 9, name: 'Claude 渠道' }; },
+    findSessionFn: async site => ({ email: `${site.name}@example.com`, storage_state: { cookies: [{ name: 'user_session' }] } }),
+    getSessionCookiesFn: session => session.storage_state.cookies,
+    probeSiteGroupsFn: async site => {
+      order.push(`probe:${site.name}`);
+      return { options: [{ value: 'default', label: `${site.name} default`, source: 'live' }] };
+    },
+    promptSiteGroupSelectionFn: async (site, options) => {
+      order.push(`prompt:${site.name}`);
+      return options;
+    },
+  });
+
+  assert.deepEqual(order, ['upload', 'probe:a6api', 'prompt:a6api', 'probe:cun.ai', 'prompt:cun.ai']);
+  assert.equal(prepared.reused, false);
+  assert.equal(prepared.file, file);
+  assert.deepEqual(prepared.config.uploadGroup, { id: 9, name: 'Claude 渠道' });
+  assert.deepEqual(Object.keys(prepared.config.sites), ['a6api', 'cun.ai']);
+  assert.equal(fs.existsSync(file), true);
+  assert.equal(env.OAUTH_SITE_GROUP_CONFIG_FILE, file);
+  assert.equal(env.UPLOAD_GROUP_ID, '9');
+});
+
+test('prepareBatchGroupConfig reuses a valid file without resolving or prompting groups', async () => {
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'oauth-batch-reuse-'));
+  const file = path.join(rootDir, 'groups.json');
+  const config = {
+    version: 1,
+    savedAt: '2026-07-11T00:00:00.000Z',
+    uploadGroup: { id: 3, name: 'Reuse' },
+    sites: { a6api: { source: 'live', selected: [{ value: 'default', label: 'Default', source: 'live' }] } },
+  };
+  writeGroupConfig(file, config);
+  const env = {};
+  const forbidden = async () => { throw new Error('must not run during reuse'); };
+
+  const prepared = await prepareBatchGroupConfig(env, { reuseGroupConfig: true, groupConfigFile: file }, {
+    rootDir,
+    targetSites: [{ name: 'a6api' }],
+    resolveUploadGroupFn: forbidden,
+    probeSiteGroupsFn: forbidden,
+    promptSiteGroupSelectionFn: forbidden,
+  });
+
+  assert.equal(prepared.reused, true);
+  assert.deepEqual(prepared.config, config);
+  assert.equal(env.UPLOAD_GROUP_ID, '3');
+  assert.equal(env.UPLOAD_GROUP_NAME, 'Reuse');
+  assert.equal(env.OAUTH_SITE_GROUP_CONFIG_FILE, file);
+});
+
+test('main persists group choices before starting the success-counted batch', async () => {
+  const order = [];
+  const env = { OAUTH_SITE_BATCH_TOTAL: '1' };
+  const result = await main({
+    env,
+    argv: ['--reuse-group-config'],
+    prepareBatchGroupConfigFn: async (_env, args) => {
+      order.push(`prepare:${args.reuseGroupConfig}`);
+      return { config: { uploadGroup: { id: 1, name: 'default' } }, file: '/tmp/groups.json', reused: true };
+    },
+    runBatchFn: async config => {
+      order.push(`run:${config.total}`);
+      return { total: config.total, ok: config.total, failed: 0, attempted: config.total };
+    },
+    log: false,
+  });
+
+  assert.deepEqual(order, ['prepare:true', 'run:1']);
+  assert.deepEqual(result, { total: 1, ok: 1, failed: 0, attempted: 1 });
 });

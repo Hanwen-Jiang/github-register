@@ -408,3 +408,27 @@ test('Stage B prefers original upstream proxy over browser bridge proxy', async 
 
   assert.deepEqual(proxyUrls, ['socks5://real:pw@proxy.example:10000']);
 });
+
+test('Stage B forwards persisted per-site group selections and does not pass global routing profiles', async () => {
+  const rootDir = tmpRoot();
+  seedSession(rootDir);
+  const selected = [{ value: 'default', label: '默认分组', source: 'live' }];
+  let captured = null;
+
+  const out = await oauthSite.main({
+    args: { email: '', site: 'a6api' },
+    rootDir,
+    siteGroupSelections: { a6api: selected },
+    routingProfiles: [{ name: 'dynamic-cheap' }],
+    runSitesOAuthHttp: async (sites, _cookies, opts) => {
+      captured = opts;
+      return sites.map(site => ({ site: site.name, baseUrl: site.baseUrl, userId: '42', apiKey: 'sk-default', profile: null, group: 'default', groupSource: 'live' }));
+    },
+    uploadResult: async () => ({}),
+    importToApi: false,
+  });
+
+  assert.equal(out.success, true);
+  assert.deepEqual(captured.siteGroupSelections, { a6api: selected });
+  assert.equal(captured.routingProfiles, undefined);
+});

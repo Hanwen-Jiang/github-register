@@ -72,6 +72,45 @@ node oauth-site.js --email alice@han-wen.top          # 该账号 OAuth 所有�
 
 前提：`sessions.jsonl` 里得先有 ① 攒下的 session，否则报「没有可复用 session」。
 
+### Session 合并与重筛
+
+先把主 session、`sessions.win_gw_lou*.jsonl`、remote imports、backups 和 cookie archives 合并，并按 GitHub 用户搜索结果与实际 cookie 登录态重筛：
+
+```bash
+npm run sessions:rescreen
+
+# 只做账号存在性和现有 cookie 检查，不重新登录过期 session
+npm run sessions:rescreen -- --no-refresh
+
+# 小批验证
+npm run sessions:rescreen -- --limit 25
+```
+
+源文件不会被改写。派生文件为：
+
+- `data/sessions.merged.jsonl`
+- `data/sessions.rescreened.usable.jsonl`
+- `data/sessions.rescreened.rejected.jsonl`
+- `data/sessions.rescreened.report.json`
+
+`oauth:site:batch` 优先使用 `sessions.rescreened.usable.jsonl`，没有时使用 `sessions.win_gw_lou.usable.jsonl`，最后才回退到 `sessions.jsonl`。可用 `SESSION_STORE_FILE` 显式覆盖。
+
+### OAuth 站点批处理与分组选择
+
+```bash
+# 启动前先选择 Sub2API 上传分组，再逐站拉取并复选创建 key 的站内分组
+npm run oauth:site:batch
+
+# 复用上一次完整分组配置，不再询问或预检
+npm run oauth:site:batch -- --reuse-group-config
+
+# 指定配置文件；首次写入或后续复用
+npm run oauth:site:batch -- --group-config data/my-oauth-groups.json
+npm run oauth:site:batch -- --group-config data/my-oauth-groups.json --reuse-group-config
+```
+
+默认保存到 `data/oauth-site-batch-groups.json`。每站多选几个分组就创建几个 key。a6api 优先使用 `/api/user/self/groups` 的实时结果；只有实时拉取失败或返回空时才回退到原有 4 个 routing profile。其他站不会使用 a6api routing 参数。Sub2API 账号的优先级、并发数、代理和上传参数保持原值。
+
 ---
 
 ## ③ 注册 + OAuth 一条龙
@@ -142,6 +181,8 @@ EXPORT_COOKIES_PATH=/path/cookies.json node index.js            # 注册后导�
 | `PROXY_RETRIES=3` | ① ③ | 代理故障转移最多试几个（默认 3，之后直连） |
 | `EMAIL_COLLISION_RETRY=5` | ① ③ | 邮箱撞车自动换新重试上限 |
 | `PRESERVE_PROFILE=1` | ① ③ | 不清 `.chrome-profile`（复用模式） |
+| `SESSION_STORE_FILE=...` | ② | 指定 Stage B / batch 使用的 session JSONL |
+| `OAUTH_SITE_GROUP_CONFIG_FILE=...` | ② | 指定 batch 分组选择持久化文件 |
 
 ---
 

@@ -195,3 +195,29 @@ test('quarantineSuspendedSession marks latest session and writes isolated suspen
   assert.equal(suspended[0].email, 'a@nsnzd.com');
   assert.equal(suspended[0].last_error, 'Account suspended');
 });
+
+test('sessionFile option redirects reads and appends without changing the default store', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sess-custom-'));
+  const defaultPath = path.join(dir, 'data', 'sessions.jsonl');
+  const customPath = path.join(dir, 'data', 'sessions.rescreened.usable.jsonl');
+
+  store.appendSession(baseRecord({ email: 'default@nsnzd.com' }), { file: defaultPath });
+  store.appendSession(baseRecord({ email: 'custom@nsnzd.com' }), { rootDir: dir, sessionFile: customPath });
+
+  assert.deepEqual(store.listSessions({ file: defaultPath }).map(item => item.email), ['default@nsnzd.com']);
+  assert.deepEqual(store.listSessions({ rootDir: dir, sessionFile: customPath }).map(item => item.email), ['custom@nsnzd.com']);
+});
+
+test('SESSION_STORE_FILE selects the derived usable pool when no explicit file is provided', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sess-env-'));
+  const customPath = path.join(dir, 'sessions.rescreened.usable.jsonl');
+  fs.writeFileSync(customPath, `${JSON.stringify(baseRecord({ email: 'env@nsnzd.com' }))}\n`);
+  const previous = process.env.SESSION_STORE_FILE;
+  process.env.SESSION_STORE_FILE = customPath;
+  try {
+    assert.deepEqual(store.listSessions({ rootDir: dir }).map(item => item.email), ['env@nsnzd.com']);
+  } finally {
+    if (previous === undefined) delete process.env.SESSION_STORE_FILE;
+    else process.env.SESSION_STORE_FILE = previous;
+  }
+});

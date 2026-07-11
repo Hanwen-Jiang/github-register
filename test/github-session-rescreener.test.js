@@ -23,6 +23,9 @@ test('discoverSessionFiles includes session stores, imports, backups, and cookie
   fs.writeFileSync(path.join(rootDir, 'data', 'github-cookies.json'), JSON.stringify({ email: 'latest@example.com', cookies: [] }));
   fs.writeFileSync(path.join(rootDir, 'data', 'github-cookies', 'one.json'), JSON.stringify({ email: 'cookie@example.com', storage_state: { cookies: [] } }));
   fs.writeFileSync(path.join(rootDir, 'data', 'github-session-live-check.json'), JSON.stringify({ ok: [], bad: [] }));
+  writeJsonl(path.join(rootDir, 'data', 'sessions.merged.jsonl'), [{ email: 'derived@example.com' }]);
+  writeJsonl(path.join(rootDir, 'data', 'sessions.rescreened.usable.jsonl'), [{ email: 'derived-usable@example.com' }]);
+  writeJsonl(path.join(rootDir, 'data', 'sessions.rescreened.rejected.jsonl'), [{ email: 'derived-rejected@example.com' }]);
   fs.writeFileSync(path.join(rootDir, 'data', 'results.jsonl'), '{}\n');
 
   const { discoverSessionFiles } = require('../lib/github-session-rescreener');
@@ -250,11 +253,99 @@ test('rescreen CLI parses refresh and output options', () => {
     outputDir: '',
     limit: Infinity,
     searchDelayMs: 100,
+    searchBatchSize: 2,
   });
-  assert.deepEqual(parseArgs(['--no-refresh', '--output-dir', '/tmp/out', '--limit', '25', '--search-delay-ms', '250']), {
+  assert.deepEqual(parseArgs(['--no-refresh', '--output-dir', '/tmp/out', '--limit', '25', '--search-delay-ms', '250', '--search-batch-size', '3']), {
     refreshExpired: false,
     outputDir: '/tmp/out',
     limit: 25,
     searchDelayMs: 250,
+    searchBatchSize: 3,
   });
+});
+
+test('requestGithubUserSearch retries 429 responses using Retry-After', async () => {
+  const { requestGithubUserSearch } = require('../rescreen-github-sessions');
+  const waits = [];
+  const retries = [];
+  let calls = 0;
+  const client = {
+    async get() {
+      calls += 1;
+      if (calls === 1) {
+        return {
+          status: 429,
+          headers: { 'retry-after': '2' },
+          text: () => 'rate limited',
+          json: () => null,
+        };
+      }
+      return {
+        status: 200,
+        headers: {},
+        text: () => '',
+        json: () => ({ payload: { results: [{ login: 'alive-user' }] } }),
+      };
+    },
+  };
+
+  const json = await requestGithubUserSearch(client, 'alive-user', {
+    retries: 2,
+    sleep: async ms => waits.push(ms),
+    onRetry: event => retries.push(event),
+  });
+
+  assert.equal(calls, 2);
+  assert.deepEqual(waits, [2000]);
+  assert.deepEqual(retries, [{ username: 'alive-user', attempt: 1, waitMs: 2000, status: 429 }]);
+  assert.equal(json.payload.results[0].login, 'alive-user');
+});
+
+test('searchGithubUsersInBatches uses OR queries and keeps exact result logins', async () => {
+  const { searchGithubUsersInBatches } = require('../rescreen-github-sessions');
+  const queries = [];
+  const waits = [];
+  const existing = new Set(['user-a', 'user-c', 'user-e']);
+
+  const alive = await searchGithubUsersInBatches(
+    ['user-a', 'user-b', 'user-c', 'user-d', 'user-e'],
+    {
+      batchSize: 2,
+      delayMs: 50,
+      sleep: async ms => waits.push(ms),
+      requestSearch: async query => {
+        queries.push(query);
+        return {
+          payload: {
+            results: query.split(' OR ').filter(login => existing.has(login)).map(login => ({ login })),
+          },
+        };
+      },
+    },
+  );
+
+  assert.deepEqual(queries, ['user-a OR user-b', 'user-c OR user-d', 'user-e']);
+  assert.deepEqual([...alive].sort(), ['user-a', 'user-c', 'user-e']);
+  assert.deepEqual(waits, [50, 50]);
+});
+
+test('findSearchClient prioritizes sessions.win_gw_lou.usable records', async () => {
+  const { findSearchClient } = require('../rescreen-github-sessions');
+  const attempted = [];
+  const records = [
+    { username: 'backup', storage_state: { cookies: [{ name: 'user_session' }] }, source_file: '/repo/data/backups/old.jsonl' },
+    { username: 'usable', storage_state: { cookies: [{ name: 'user_session' }] }, source_file: '/repo/data/sessions.win_gw_lou.usable.jsonl' },
+  ];
+
+  const client = await findSearchClient(records, {
+    probeUsername: 'known-alive',
+    clientFactory: session => ({ username: session.username }),
+    requestSearch: async candidate => {
+      attempted.push(candidate.username);
+      return { payload: { results: candidate.username === 'usable' ? [{ login: 'known-alive' }] : [] } };
+    },
+  });
+
+  assert.equal(client.username, 'usable');
+  assert.deepEqual(attempted, ['usable']);
 });

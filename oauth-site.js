@@ -45,9 +45,13 @@ function planWork(targetSites, args, deps) {
   const { findSession, findReusableSession } = deps;
   const findAvailableSession = deps.findAvailableSession || findReusableSession;
   const allowedProxies = deps.allowedProxies; // undefined = no proxy filter (local)
+  const sessionOpts = {
+    rootDir: deps.rootDir,
+    ...(deps.sessionFile ? { file: deps.sessionFile } : {}),
+  };
   const plan = [];
   if (args.email) {
-    const sess = findSession(args.email, { rootDir: deps.rootDir });
+    const sess = findSession(args.email, sessionOpts);
     if (!sess) throw new Error(`no session for ${args.email}`);
     for (const site of targetSites) {
       if ((sess.sites_registered || {})[site.name]) {
@@ -59,7 +63,7 @@ function planWork(targetSites, args, deps) {
     return plan;
   }
   for (const site of targetSites) {
-    const sess = findAvailableSession(site.name, { rootDir: deps.rootDir, allowedProxies });
+    const sess = findAvailableSession(site.name, { ...sessionOpts, allowedProxies });
     if (!sess) {
       console.log(`  ⚠️ 没有可复用 session 用于 ${site.name}`);
       continue;
@@ -194,14 +198,22 @@ async function main(opts = {}) {
   const uploadResult = opts.uploadResult || require('./lib/result-uploader').uploadResult;
   const reuploadUnuploaded = opts.reuploadUnuploaded || require('./register-upload-retry').reuploadUnuploaded;
   const resolveUploadGroup = opts.resolveUploadGroupFn || require('./lib/api-nsnzd-uploader').resolveUploadGroup;
-  const routingProfiles = opts.routingProfiles || sitesLib.resolveRoutingProfiles();
   const rootDir = opts.rootDir || __dirname;
+  const sessionFile = opts.sessionFile || process.env.SESSION_STORE_FILE || process.env.SESSIONS_FILE || '';
+  const storeOpts = { rootDir, ...(sessionFile ? { file: sessionFile } : {}) };
   const importToApi = opts.importToApi ?? process.env.OAUTH_SITE_IMPORT_API_NSNZD !== 'false';
   const apiAdminKey = opts.apiAdminKey || process.env.API_NSNZD_COM_ADMIN_KEY || '';
   const ledgerFile = opts.ledgerFile || process.env.UPLOAD_LEDGER_FILE || path.join(rootDir, 'data', 'uploaded.jsonl');
 
   const targetSites = sitesLib.resolveTargetSites(args.site || undefined);
   if (targetSites.length === 0) throw new Error(`no target sites match filter: ${args.site}`);
+  let siteGroupSelections = opts.siteGroupSelections || null;
+  const groupConfigFile = opts.groupConfigFile || process.env.OAUTH_SITE_GROUP_CONFIG_FILE || '';
+  if (!siteGroupSelections && groupConfigFile) {
+    const config = require('./lib/site-groups').readGroupConfig(groupConfigFile, targetSites);
+    siteGroupSelections = Object.fromEntries(targetSites.map(site => [site.name, config.sites[site.name].selected]));
+  }
+  siteGroupSelections ||= {};
 
   const plan = planWork(targetSites, args, {
     findSession: store.findSession,
@@ -209,6 +221,7 @@ async function main(opts = {}) {
     findAvailableSession: store.findAvailableSession,
     allowedProxies: opts.allowedProxies,
     rootDir,
+    sessionFile,
   });
   if (plan.length === 0) {
     console.log('无可执行的 (session, site) 组合。');
@@ -235,7 +248,7 @@ async function main(opts = {}) {
       continue;
     }
     try {
-      const latestSession = store.findSession(session.email, { rootDir }) || session;
+      const latestSession = store.findSession(session.email, storeOpts) || session;
       if (latestSession.status !== 'active') {
         console.log(`  ↷ ${latestSession.email} 状态=${latestSession.status || 'unknown'}，跳过 ${site.name}`);
         continue;
@@ -249,25 +262,33 @@ async function main(opts = {}) {
       const cookies = store.getSessionCookies(latestSession);
       let siteResults;
       try {
-        siteResults = await runSitesOAuthHttp([site], cookies, { proxyUrl: resolveSessionProxyUrl(latestSession), routingProfiles });
+        siteResults = await runSitesOAuthHttp([site], cookies, {
+          proxyUrl: resolveSessionProxyUrl(latestSession),
+          siteGroupSelections,
+        });
       } catch (err) {
         console.error(`  ❌ ${site.name} OAuth 失败: ${err.message}`);
         const patch = { last_error: String(err.message).slice(0, 500) };
         if (isGithubSuspendedError(err)) {
-          store.quarantineSuspendedSession(latestSession.email, patch, { rootDir });
+          store.quarantineSuspendedSession(latestSession.email, patch, storeOpts);
           console.error(`  🚫 ${latestSession.email} GitHub account suspended，已隔离到 sessions.suspended.jsonl`);
         } else if (isGithubLoginRequiredError(err)) {
           patch.status = 'github_login_required';
           console.error(`  🚫 ${latestSession.email} GitHub session 已失效，标记为 github_login_required，后续跳过`);
-          store.updateSession(latestSession.email, patch, { rootDir });
+          store.updateSession(latestSession.email, patch, storeOpts);
         } else {
-          store.updateSession(latestSession.email, patch, { rootDir });
+          store.updateSession(latestSession.email, patch, storeOpts);
         }
         continue;
       }
-      const keys = siteResults.map(r => ({ apiKey: r.apiKey, profile: r.profile }));
+      const keys = siteResults.map(r => ({
+        apiKey: r.apiKey,
+        profile: r.profile,
+        ...(Object.prototype.hasOwnProperty.call(r, 'group') ? { group: r.group } : {}),
+        ...(r.groupSource ? { groupSource: r.groupSource } : {}),
+      }));
       const userId = siteResults[0] && siteResults[0].userId;
-      store.markSiteRegistered(latestSession.email, site.name, { userId, keys }, { rootDir });
+      store.markSiteRegistered(latestSession.email, site.name, { userId, keys }, storeOpts);
 
       const result = {
         success: true,

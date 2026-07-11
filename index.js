@@ -74,6 +74,10 @@ const CONFIG = {
 const { SITES, TARGET_SITES, DEFAULT_ROUTING_PROFILES, resolveRoutingProfiles } = require('./lib/sites');
 const routingProfiles = resolveRoutingProfiles();
 
+function resolveBrowserTokenProfiles(site, profiles = routingProfiles) {
+    return site?.name === 'a6api' ? profiles : [null];
+}
+
 // ──────────────────────────────────────────────────────────
 // 2. 姓名生成器（中文姓氏 + 西式名字 → 真人感邮箱）
 // ──────────────────────────────────────────────────────────
@@ -1086,7 +1090,7 @@ async function runOAuthOnly(opts = {}) {
         throw new Error('OAUTH_ONLY requires EXPORT_COOKIES_PATH or SIGNUP_EMAIL');
     }
 
-    const results = await runSitesOAuthHttp(TARGET_SITES, cookies, { proxyUrl: pickProxy() || '', routingProfiles });
+    const results = await runSitesOAuthHttp(TARGET_SITES, cookies, { proxyUrl: pickProxy() || '' });
     const duration = ((Date.now() - startedAt) / 1000).toFixed(1);
     const result = { success: true, email, username, password, keys: results, durationSeconds: parseFloat(duration) };
     await uploadResult({ ...result, source: 'oauth-only' }, { meta: { source: 'index', mode: 'oauth-only' } });
@@ -1125,7 +1129,7 @@ async function main() {
         if (CONFIG.hybridHttpOAuth) {
             console.log('  模式: Hybrid HTTP OAuth（GitHub 注册保留浏览器，OAuth/Token 使用 HTTP）');
             const githubCookies = storageState.cookies || [];
-            results = await runSitesOAuthHttp(TARGET_SITES, githubCookies, { proxyUrl: proxyUrl || '', routingProfiles });
+            results = await runSitesOAuthHttp(TARGET_SITES, githubCookies, { proxyUrl: proxyUrl || '' });
             for (const r of results) {
                 console.log(`  🎉 ${r.site} [${r.profile || 'default'}] Key: ${r.apiKey.substring(0, 12)}...`);
             }
@@ -1231,16 +1235,17 @@ async function main() {
                 }
                 console.log(`  ✅ ${site.name} user ID: ${siteUserId}`);
 
-                // 8. 创建 API Token (循环 profiles 建多个)
+                // 8. 创建 API Token；routing profiles 仅属于 a6api。
                 const siteKeys = [];
-                for (const profile of routingProfiles) {
-                    console.log(`  🔧 Creating token with profile: ${profile.name}`);
+                for (const profile of resolveBrowserTokenProfiles(site)) {
+                    const profileName = profile?.name || 'default';
+                    console.log(`  🔧 Creating token with profile: ${profileName}`);
                     try {
                         const keyObj = await siteCreateToken(site, siteSession, siteUserId, profile);
                         siteKeys.push(keyObj);
-                        console.log(`  ✅ ${profile.name}: ${keyObj.apiKey.substring(0, 12)}...`);
+                        console.log(`  ✅ ${profileName}: ${keyObj.apiKey.substring(0, 12)}...`);
                     } catch (err) {
-                        console.error(`  ❌ ${profile.name} failed: ${err.message}`);
+                        console.error(`  ❌ ${profileName} failed: ${err.message}`);
                         // Continue with remaining profiles
                     }
                 }
@@ -1331,4 +1336,4 @@ if (require.main === module) {
         });
 }
 
-module.exports = { main, registerGithubAccount, runOAuthOnly, applyServerEnvContract, generateIdentity, reserveEmail, buildRandomNsnzdEmail, pollOTP, siteCreateToken, SITES, TARGET_SITES, randomGithubUsername, assertSafeGithubUsername, isGithubLoggedInUrl, ensureGithubLoggedIn, dismissGitHubCookieBanner, resolveReusableProxyUrl, resolveChromiumExecutablePath };
+module.exports = { main, registerGithubAccount, runOAuthOnly, applyServerEnvContract, generateIdentity, reserveEmail, buildRandomNsnzdEmail, pollOTP, siteCreateToken, resolveBrowserTokenProfiles, SITES, TARGET_SITES, randomGithubUsername, assertSafeGithubUsername, isGithubLoggedInUrl, ensureGithubLoggedIn, dismissGitHubCookieBanner, resolveReusableProxyUrl, resolveChromiumExecutablePath };

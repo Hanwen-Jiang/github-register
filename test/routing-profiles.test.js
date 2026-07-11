@@ -2,6 +2,15 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { siteCreateToken } = require('../index.js');
 
+test('resolveBrowserTokenProfiles limits routing profiles to a6api', () => {
+    const { resolveBrowserTokenProfiles } = require('../index.js');
+    const profiles = [{ name: 'dynamic-cheap' }, { name: 'dynamic-fast' }];
+
+    assert.deepEqual(resolveBrowserTokenProfiles({ name: 'a6api' }, profiles), profiles);
+    assert.deepEqual(resolveBrowserTokenProfiles({ name: 'cun.ai' }, profiles), [null]);
+    assert.deepEqual(resolveBrowserTokenProfiles({ name: 'xyc.ai' }, profiles), [null]);
+});
+
 test('siteCreateToken includes routing fields when profile provided', async () => {
     let capturedPayload = null;
     const fakeSite = { name: 'test', baseUrl: 'https://test.com', tokenName: 'test' };
