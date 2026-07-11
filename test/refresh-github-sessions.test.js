@@ -126,3 +126,41 @@ test('isGithubSuspendedError recognizes GitHub suspended URL redirects', () => {
   assert.equal(refresh.isGithubSuspendedError('github_login_failed_url:https://github.com/account/suspended'), true);
   assert.equal(refresh.isGithubSuspendedError('temporary login failure'), false);
 });
+
+test('maybeHandleLoginVerification accepts verified-device pages that mention enabling two-factor auth', async () => {
+  let filled = '';
+  let clicked = false;
+  let clickOptions = null;
+  const otp = {
+    first() { return this; },
+    async isVisible() { return true; },
+    async fill(value) { filled = value; },
+  };
+  const submit = {
+    first() { return this; },
+    async isVisible() { return true; },
+    async click(options) { clicked = true; clickOptions = options; },
+  };
+  const page = {
+    url: () => 'https://github.com/sessions/verified-device',
+    locator(selector) {
+      if (selector === 'body') {
+        return { innerText: async () => 'Device verification\nConsider enabling two-factor authentication on your account.' };
+      }
+      if (selector.includes('input[name="otp"]')) return otp;
+      if (selector.includes('button[type="submit"]')) return submit;
+      throw new Error(`unexpected selector: ${selector}`);
+    },
+    waitForLoadState: async () => {},
+    waitForTimeout: async () => {},
+  };
+
+  const handled = await refresh.maybeHandleLoginVerification(page, { email: 'seed@example.com' }, {
+    pollOTP: async () => '123456',
+  });
+
+  assert.equal(handled, true);
+  assert.equal(filled, '123456');
+  assert.equal(clicked, true);
+  assert.deepEqual(clickOptions, { noWaitAfter: true });
+});

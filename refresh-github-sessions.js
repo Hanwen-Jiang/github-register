@@ -101,14 +101,15 @@ async function maybeHandleLoginVerification(page, session, opts = {}) {
   const pollOTP = opts.pollOTP || require('./index').pollOTP;
   const url = page.url();
   const bodyText = await page.locator('body').innerText({ timeout: 3000 }).catch(() => '');
+  const isVerifiedDevice = /verified-device/i.test(url) || /device verification/i.test(bodyText);
 
-  if (/two-factor|2fa/i.test(url) || /two-factor|two factor|2FA/i.test(bodyText)) {
+  if (/two-factor|2fa/i.test(url) || (!isVerifiedDevice && /two-factor|two factor|2FA/i.test(bodyText))) {
     throw new Error('github_login_two_factor_required');
   }
 
   const otpInput = page.locator('input[name="otp"], input#otp, input[name="code"], input[autocomplete="one-time-code"]').first();
   const hasOtp = await otpInput.isVisible({ timeout: 1500 }).catch(() => false);
-  const looksDeviceVerify = /verified-device|device verification|verification code|enter.*code/i.test(url) || /device verification|verification code|enter.*code/i.test(bodyText);
+  const looksDeviceVerify = isVerifiedDevice || /verification code|enter.*code/i.test(url) || /verification code|enter.*code/i.test(bodyText);
   if (!hasOtp && !looksDeviceVerify) return false;
 
   const code = await pollOTP(session.email, {
@@ -130,7 +131,7 @@ async function maybeHandleLoginVerification(page, session, opts = {}) {
   }
 
   const submit = page.locator('button[type="submit"], input[type="submit"]').first();
-  if (await submit.isVisible({ timeout: 2000 }).catch(() => false)) await submit.click();
+  if (await submit.isVisible({ timeout: 2000 }).catch(() => false)) await submit.click({ noWaitAfter: true });
   await page.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
   await page.waitForTimeout(1500);
   return true;
