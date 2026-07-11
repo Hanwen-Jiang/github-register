@@ -253,7 +253,7 @@ test('rescreen CLI parses refresh and output options', () => {
     outputDir: '',
     limit: Infinity,
     searchDelayMs: 100,
-    searchBatchSize: 2,
+    searchBatchSize: 6,
   });
   assert.deepEqual(parseArgs(['--no-refresh', '--output-dir', '/tmp/out', '--limit', '25', '--search-delay-ms', '250', '--search-batch-size', '3']), {
     refreshExpired: false,
@@ -298,6 +298,37 @@ test('requestGithubUserSearch retries 429 responses using Retry-After', async ()
   assert.equal(calls, 2);
   assert.deepEqual(waits, [2000]);
   assert.deepEqual(retries, [{ username: 'alive-user', attempt: 1, waitMs: 2000, status: 429 }]);
+  assert.equal(json.payload.results[0].login, 'alive-user');
+});
+
+test('requestGithubUserSearch retries transient network errors', async () => {
+  const { requestGithubUserSearch } = require('../rescreen-github-sessions');
+  const waits = [];
+  let calls = 0;
+  const client = {
+    async get() {
+      calls += 1;
+      if (calls === 1) {
+        const error = new Error('dns unavailable');
+        error.code = 'ENOTFOUND';
+        throw error;
+      }
+      return {
+        status: 200,
+        headers: {},
+        text: () => '',
+        json: () => ({ payload: { results: [{ login: 'alive-user' }] } }),
+      };
+    },
+  };
+
+  const json = await requestGithubUserSearch(client, 'alive-user', {
+    retries: 2,
+    sleep: async ms => waits.push(ms),
+  });
+
+  assert.equal(calls, 2);
+  assert.deepEqual(waits, [5000]);
   assert.equal(json.payload.results[0].login, 'alive-user');
 });
 
@@ -348,4 +379,45 @@ test('findSearchClient prioritizes sessions.win_gw_lou.usable records', async ()
 
   assert.equal(client.username, 'usable');
   assert.deepEqual(attempted, ['usable']);
+});
+
+test('searchGithubUsersInBatches resumes known results and checkpoints new batches', async () => {
+  const { searchGithubUsersInBatches } = require('../rescreen-github-sessions');
+  const knownResults = new Map([['user-a', true], ['user-b', false]]);
+  const queries = [];
+  const checkpoints = [];
+
+  const alive = await searchGithubUsersInBatches(['user-a', 'user-b', 'user-c'], {
+    batchSize: 2,
+    knownResults,
+    requestSearch: async query => {
+      queries.push(query);
+      return { payload: { results: [{ login: 'user-c' }] } };
+    },
+    onBatchResult: results => checkpoints.push(Object.fromEntries(results)),
+  });
+
+  assert.deepEqual(queries, ['user-c']);
+  assert.deepEqual([...alive].sort(), ['user-a', 'user-c']);
+  assert.equal(checkpoints.length, 1);
+  assert.deepEqual(checkpoints[0], { 'user-a': true, 'user-b': false, 'user-c': true });
+});
+
+test('readSearchProgress reuses the current username intersection when the input fingerprint grows', () => {
+  const rootDir = makeRoot();
+  const progressFile = path.join(rootDir, 'search-progress.json');
+  fs.writeFileSync(progressFile, JSON.stringify({
+    version: 1,
+    fingerprint: 'old-input-fingerprint',
+    results: {
+      'user-a': true,
+      'user-b': false,
+      'removed-user': true,
+    },
+  }));
+  const { readSearchProgress } = require('../rescreen-github-sessions');
+
+  const resumed = readSearchProgress(progressFile, 'new-input-fingerprint', ['USER-A', 'user-b', 'new-user']);
+
+  assert.deepEqual(Object.fromEntries(resumed), { 'user-a': true, 'user-b': false });
 });
