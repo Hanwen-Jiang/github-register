@@ -12,6 +12,7 @@
     "test": "node --test --test-concurrency=1",
     "register": "node register-github.js",
     "sessions": "node list-sessions.js",
+    "sessions:rescreen": "node rescreen-github-sessions.js",
     "oauth:site": "node oauth-site.js",
     "oauth:site:batch": "node oauth-site-batch.js",
     "oauth": "node oauth-only.js",
